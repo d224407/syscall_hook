@@ -1,0 +1,35 @@
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Binary
+*.bin
+*.kpm
+
+# Editors
+*.vscode
+.idea/
+*.iml
+
+# Other
+*.bak
+*_test
+
+# Android / Gradle
+.gradle/
+build/
+local.properties
+keystore.properties
+*.jks
+*.apk

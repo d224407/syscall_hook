@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * syscall_logger.c (v0.6.0) - KPM tracing su-related syscalls of a PID tree.
+ * syscall_logger.c (v0.7.0) - KPM tracing su-related syscalls of a PID tree.
  *
  * Logic:
  *  - Tracked set = table of tgids. A process joins if it is listed (add),
@@ -11,8 +11,9 @@
  *    verbose), execve/execveat (+argv), connect (+addr), setuid family,
  *    ptrace, mount, clone, exit_group, read(0) (shell stdin, i.e. commands
  *    pushed through a pipe), sendto (DNS query name, UDP:53), write (HTTP
- *    request line + Host, or TLS ClientHello SNI). "[!]" marks su-like /
- *    uid 0 / remount.
+ *    request line + Host, TLS ClientHello SNI, and with `wr 1` the printable
+ *    text of any other write, e.g. commands pushed over a pipe fd). "[!]"
+ *    marks su-like / uid 0 / remount.
  *  - Output: printk only ("[SCL]" in dmesg); the viewer app reads dmesg, so
  *    there is no separate file sink to manage.
  *  - Heartbeat: the viewer app sends `ping` every few seconds while a target
@@ -38,7 +39,7 @@
  *   as root: readlink '/.scl:<token> <cmd>'  -> answer in dmesg "[SCL]ctl <token> <result>"
  * Commands (that channel, or APatch app: KPM tab -> module Control; also load args):
  *   add <pid> | del <pid> | uid <n> | target <uid> | clear | prune | ping
- *   | hb <0|1> | verbose <0|1> | list      (a bare number means pid)
+ *   | hb <0|1> | wr <0|1> | verbose <0|1> | list      (a bare number means pid)
  *   clear  = drop all pids AND the seed uid (uid auto-attach would re-add pids).
  *   target = clear, then auto-attach every process of <uid>.
  *   ping   = refresh the heartbeat only (same effect as any other command).
@@ -55,7 +56,7 @@
 #include <asm/current.h>
 
 KPM_NAME("syscall_logger");
-KPM_VERSION("0.6.0");
+KPM_VERSION("0.7.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("you");
 KPM_DESCRIPTION("Trace su-related syscalls of a PID tree (optionally seeded by UID)");
@@ -136,6 +137,7 @@ static scnprintf_t kf_scnprintf = 0;
 /* heartbeat: app must `ping` periodically or the target is auto-cleared */
 static long (*kf_now)(void) = 0; /* seconds, ktime_get_real_seconds/ktime_get_seconds */
 static volatile long last_ping = 0;
+static volatile int wr_mode = 0;    /* `wr 1`: also log printable write() payloads */
 static volatile int hb_enabled = 1; /* `hb 0` disables the auto-clear, kf_now resolved or not */
 #define HEARTBEAT_TIMEOUT 20 /* seconds */
 
@@ -741,6 +743,31 @@ static int dns_qname(const unsigned char *b, int n, char *out, int cap)
 	return j > 0;
 }
 
+/* Printable text preview of a write() payload; empty string for binary data. */
+static void write_preview(const unsigned char *b, int n, char *out, int cap)
+{
+	int i, j = 0, printable = 0;
+	int m = n > 160 ? 160 : n;
+
+	out[0] = 0;
+	for (i = 0; i < m; i++)
+		if ((b[i] >= 32 && b[i] < 127) || b[i] == 9 || b[i] == 10 || b[i] == 13)
+			printable++;
+	if (printable * 10 < m * 8)
+		return; /* mostly binary: skip */
+	for (i = 0; i < m && j < cap - 4; i++) {
+		if (b[i] == 10) {
+			out[j++] = 92; /* backslash */
+			out[j++] = 110; /* n */
+		} else if (b[i] >= 32 && b[i] < 127) {
+			out[j++] = (char)b[i];
+		} else if (b[i] == 9) {
+			out[j++] = 32;
+		}
+	}
+	out[j] = 0;
+}
+
 /* sendto(int fd, const void *buf, size_t len, int flags, struct sockaddr *dest_addr, int addrlen) */
 static void h_sendto(hook_fargs6_t *a, void *udata)
 {
@@ -785,7 +812,7 @@ static void h_write(hook_fargs3_t *a, void *udata)
 
 	if (!is_target(&pid))
 		return;
-	if (len < 16)
+	if (len < 1 || (len < 16 && !wr_mode))
 		return;
 	if (len > (long)sizeof(buf))
 		len = (long)sizeof(buf);
@@ -801,6 +828,15 @@ static void h_write(hook_fargs3_t *a, void *udata)
 	if (tls_sni(buf, (int)len, host, sizeof(host))) {
 		kf_scnprintf(d, sizeof(d), "fd=%d sni=%s", fd, host);
 		emit(pid, "tls", d, 0);
+		return;
+	}
+	if (wr_mode) {
+		write_preview(buf, (int)len, line, sizeof(line));
+		if (line[0]) {
+			kf_scnprintf(d, sizeof(d), "fd=%d len=%ld data=%s", fd,
+				     (long)syscall_argn(a, 2), line);
+			emit(pid, "write", d, 0);
+		}
 	}
 }
 
@@ -1037,7 +1073,7 @@ static void unhook_all(void)
 static void run_cmd(const char *args, char *echo, int cap)
 {
 	const char *r;
-	char tmp[64];
+	char tmp[96];
 	int len = 0, i, n = 0;
 
 	if (kf_now)
@@ -1067,6 +1103,8 @@ static void run_cmd(const char *args, char *echo, int cap)
 		track_prune();
 	} else if ((r = s_prefix(args, "hb "))) {
 		hb_enabled = parse_num(r) ? 1 : 0;
+	} else if ((r = s_prefix(args, "wr "))) {
+		wr_mode = parse_num(r) ? 1 : 0;
 	} else if ((r = s_prefix(args, "uid "))) {
 		seed_uid = (uid_t)parse_num(r);
 	} else if ((r = s_prefix(args, "verbose "))) {
@@ -1079,9 +1117,9 @@ static void run_cmd(const char *args, char *echo, int cap)
 	for (i = 0; i < MAX_TRACK; i++)
 		if (tracked[i])
 			n++;
-	kf_scnprintf(tmp, sizeof(tmp), "uid=%u verbose=%d n=%d hb=%s pids:", (unsigned int)seed_uid,
-		     (int)verbose, n,
-		     !kf_now ? "unsupported" : (hb_enabled ? "on" : "off"));
+	kf_scnprintf(tmp, sizeof(tmp), "uid=%u verbose=%d n=%d hb=%s wr=%s pids:",
+		     (unsigned int)seed_uid, (int)verbose, n,
+		     !kf_now ? "unsupported" : (hb_enabled ? "on" : "off"), wr_mode ? "on" : "off");
 	len = s_append(echo, cap, len, tmp);
 	for (i = 0; i < MAX_TRACK; i++) {
 		pid_t p = tracked[i];

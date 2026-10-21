@@ -33,4 +33,12 @@ object Prefs {
     fun setAutoTimeout(c: Context, v: Boolean) {
         sp(c).edit().putBoolean("auto_timeout", v).apply()
     }
+
+    /** "Log writes" switch on the log screen (module command `wr`): off by default,
+     * because logging every text write of the target is noisy. */
+    fun logWrites(c: Context): Boolean = sp(c).getBoolean("log_writes", false)
+
+    fun setLogWrites(c: Context, v: Boolean) {
+        sp(c).edit().putBoolean("log_writes", v).apply()
+    }
 }

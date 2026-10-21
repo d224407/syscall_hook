@@ -52,6 +52,7 @@ class LogActivity : AppCompatActivity() {
     private var query = ""
     private val activeChips = LinkedHashSet<String>()
     private var autoTimeout = true
+    private var logWrites = false
 
     private lateinit var status: TextView
     private lateinit var list: RecyclerView
@@ -79,6 +80,7 @@ class LogActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         skipExisting = intent.getBooleanExtra(EXTRA_FRESH, false)
         autoTimeout = Prefs.autoTimeout(this)
+        logWrites = Prefs.logWrites(this)
         val label = intent.getStringExtra(EXTRA_LABEL)
         val uid = intent.getIntExtra(EXTRA_UID, -1)
 
@@ -126,6 +128,15 @@ class LogActivity : AppCompatActivity() {
                 applyHeartbeatPref()
             }
         }
+        val logWritesSwitch = CheckBox(this).apply {
+            text = "Log writes"
+            isChecked = logWrites
+            setOnCheckedChangeListener { _, checked ->
+                logWrites = checked
+                Prefs.setLogWrites(this@LogActivity, checked)
+                applyHeartbeatPref()
+            }
+        }
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(pauseBtn)
@@ -136,6 +147,7 @@ class LogActivity : AppCompatActivity() {
             addView(shareBtn)
             addView(copyBtn)
             addView(autoTimeoutSwitch)
+            addView(logWritesSwitch)
         }
         val scroll = HorizontalScrollView(this).apply {
             isHorizontalScrollBarEnabled = false
@@ -202,10 +214,14 @@ class LogActivity : AppCompatActivity() {
         handler.removeCallbacks(pinger)
     }
 
-    /** Tells the module whether the heartbeat timeout applies, and starts/stops pinging to match. */
+    /** Tells the module whether the heartbeat timeout applies and whether to log write()
+     * payloads, and starts/stops pinging to match. */
     private fun applyHeartbeatPref() {
         handler.removeCallbacks(pinger)
-        io.execute { ModuleCtl.send(this, if (autoTimeout) "hb 1" else "hb 0") }
+        io.execute {
+            ModuleCtl.send(this, if (autoTimeout) "hb 1" else "hb 0")
+            ModuleCtl.send(this, if (logWrites) "wr 1" else "wr 0")
+        }
         if (autoTimeout) handler.post(pinger)
     }
 
@@ -349,7 +365,7 @@ class LogActivity : AppCompatActivity() {
         // as emitted by the module (see emit() in syscall_logger.c).
         private val CHIPS = listOf(
             "su", "execve", "connect", "setuid", "ptrace", "mount",
-            "stdin", "dns", "http", "tls", "fork", "exit"
+            "stdin", "write", "dns", "http", "tls", "fork", "exit"
         )
     }
 }
@@ -385,6 +401,7 @@ class LogAdapter(private val items: List<String>) : RecyclerView.Adapter<LogAdap
                 l.contains(" execve ") || l.contains(" execveat ") -> 0xFF1E88E5.toInt()
                 l.contains(" connect ") -> 0xFF43A047.toInt()
                 l.contains(" stdin ") -> 0xFFFB8C00.toInt()
+                l.contains(" write ") -> 0xFF8D6E63.toInt()
                 l.contains(" dns ") -> 0xFF00BCD4.toInt()
                 l.contains(" http ") || l.contains(" tls ") -> 0xFFAB47BC.toInt()
                 else -> defColor

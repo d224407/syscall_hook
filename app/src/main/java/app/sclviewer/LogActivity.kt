@@ -311,13 +311,20 @@ class LogActivity : AppCompatActivity() {
         }
     }
 
+    /** Exports what this screen collected (current filter applied), not the whole kernel log. */
     private fun export() {
+        if (shown.isEmpty()) {
+            Toast.makeText(this, "Nothing to export", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val text = shown.joinToString("\n", postfix = "\n")
+        val count = shown.size
         val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val path = "/sdcard/Download/scl_$ts.log"
         io.execute {
-            val res = Su.run("dmesg | grep SCL > $path; true")
+            val res = Su.runWithInput("cat > $path", text)
             handler.post {
-                val msg = if (res.rc == 0) "Saved $path" else "Export failed: ${res.err.trim()}"
+                val msg = if (res.rc == 0) "Saved $count lines to $path" else "Export failed: ${res.err.trim()}"
                 Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
             }
         }

@@ -16,4 +16,19 @@ object Su {
             Res(-1, "", e.message ?: e.toString())
         }
     }
+
+    /** Like run(), but feeds [input] to the command's stdin (used to write files as root). */
+    fun runWithInput(cmd: String, input: String): Res {
+        return try {
+            val p = ProcessBuilder("su", "-c", cmd).start()
+            p.outputStream.use { it.write(input.toByteArray(Charsets.UTF_8)) }
+            val out = p.inputStream.bufferedReader().readText()
+            val err = p.errorStream.bufferedReader().readText()
+            val rc = p.waitFor()
+            p.destroy()
+            Res(rc, out, err)
+        } catch (e: Exception) {
+            Res(-1, "", e.message ?: e.toString())
+        }
+    }
 }

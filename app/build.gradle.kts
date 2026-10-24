@@ -2,6 +2,7 @@ import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application) // AGP 9: Kotlin is built in, no kotlin-android plugin needed
+    alias(libs.plugins.kotlin.compose)
 }
 
 // Release signing: read from keystore.properties if present, else fall back to the debug key.
@@ -19,8 +20,8 @@ android {
         applicationId = "app.sclviewer"
         minSdk = 26
         targetSdk = 36
-        versionName = "1.5.1"
-        versionCode = 7
+        versionName = "2.0.0"
+        versionCode = 8
 
         ndk {
             abiFilters += "arm64-v8a" // KernelPatch is ARM64 only
@@ -89,6 +90,8 @@ android {
 
 dependencies {
     implementation(libs.androidx.core.ktx)
-    implementation(libs.androidx.appcompat)
-    implementation(libs.androidx.recyclerview)
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.miuix.ui)
+    implementation(libs.miuix.preference)
+    implementation(libs.miuix.icons)
 }

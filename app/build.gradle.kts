@@ -19,8 +19,8 @@ android {
         applicationId = "app.sclviewer"
         minSdk = 26
         targetSdk = 36
-        versionName = "1.4.0"
-        versionCode = 5
+        versionName = "1.5.0"
+        versionCode = 6
 
         ndk {
             abiFilters += "arm64-v8a" // KernelPatch is ARM64 only

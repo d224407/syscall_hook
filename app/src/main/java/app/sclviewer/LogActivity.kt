@@ -365,7 +365,7 @@ class LogActivity : AppCompatActivity() {
         // as emitted by the module (see emit() in syscall_logger.c).
         private val CHIPS = listOf(
             "su", "execve", "connect", "setuid", "ptrace", "mount",
-            "stdin", "write", "dns", "http", "tls", "fork", "exit"
+            "stdin", "write", "unlink", "mkdir", "rename", "socket", "bind", "dns", "http", "tls", "fork", "exit"
         )
     }
 }
@@ -402,6 +402,9 @@ class LogAdapter(private val items: List<String>) : RecyclerView.Adapter<LogAdap
                 l.contains(" connect ") -> 0xFF43A047.toInt()
                 l.contains(" stdin ") -> 0xFFFB8C00.toInt()
                 l.contains(" write ") -> 0xFF8D6E63.toInt()
+                l.contains(" unlink ") || l.contains(" rename ") -> 0xFFD81B60.toInt()
+                l.contains(" mkdir ") -> 0xFF8D6E63.toInt()
+                l.contains(" socket ") || l.contains(" bind ") -> 0xFF43A047.toInt()
                 l.contains(" dns ") -> 0xFF00BCD4.toInt()
                 l.contains(" http ") || l.contains(" tls ") -> 0xFFAB47BC.toInt()
                 else -> defColor

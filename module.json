@@ -1,8 +1,8 @@
 {
     "metamodule": false,
     "summary": {
-        "en": "Traces su-related syscalls of a target PID tree (exec argv, connect, setuid, shell stdin, DNS queries, HTTP requests, TLS SNI) to the kernel log",
-        "vi": "Theo dõi syscall liên quan tới su của cây PID mục tiêu (argv, connect, setuid, stdin shell, truy vấn DNS, HTTP request, TLS SNI) ra kernel log"
+        "en": "Traces syscalls of a target PID tree: su activity, exec argv, network (connect/DNS/HTTP/TLS SNI), file create/delete/rename, sockets, shell stdin, optional write payloads",
+        "vi": "Theo dõi syscall của cây PID mục tiêu: hoạt động su, argv, mạng (connect/DNS/HTTP/TLS SNI), tạo/xoá/đổi tên file, socket, stdin shell, tuỳ chọn ghi nội dung write"
     },
     "modulename": "Syscall Logger",
     "authors": [
@@ -10,7 +10,7 @@
     ],
     "license": "GPL-2.0-only",
     "moduleid": "syscall_logger",
-    "version": "0.7.0",
-    "VersionCode": 7,
+    "version": "0.8.0",
+    "VersionCode": 8,
     "downloadUrl": ""
 }

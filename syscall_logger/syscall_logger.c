@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * syscall_logger.c (v0.7.0) - KPM tracing su-related syscalls of a PID tree.
+ * syscall_logger.c (v0.8.0) - KPM tracing su-related syscalls of a PID tree.
  *
  * Logic:
  *  - Tracked set = table of tgids. A process joins if it is listed (add),
@@ -12,8 +12,12 @@
  *    ptrace, mount, clone, exit_group, read(0) (shell stdin, i.e. commands
  *    pushed through a pipe), sendto (DNS query name, UDP:53), write (HTTP
  *    request line + Host, TLS ClientHello SNI, and with `wr 1` the printable
- *    text of any other write, e.g. commands pushed over a pipe fd). "[!]"
- *    marks su-like / uid 0 / remount.
+ *    text of any other write, e.g. commands pushed over a pipe fd), unlinkat
+ *    (delete), mkdirat (create dir), renameat2 (move/rename), socket, bind.
+ *    "[!]" marks su-like / uid 0 / remount.
+ *  - Not covered: permission-gated framework APIs (camera, mic, location,
+ *    clipboard, contacts, SMS, ...) are Binder IPC calls into system_server,
+ *    not plain syscalls, so a syscall hook cannot see them.
  *  - Output: printk only ("[SCL]" in dmesg); the viewer app reads dmesg, so
  *    there is no separate file sink to manage.
  *  - Heartbeat: the viewer app sends `ping` every few seconds while a target
@@ -56,7 +60,7 @@
 #include <asm/current.h>
 
 KPM_NAME("syscall_logger");
-KPM_VERSION("0.7.0");
+KPM_VERSION("0.8.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("you");
 KPM_DESCRIPTION("Trace su-related syscalls of a PID tree (optionally seeded by UID)");
@@ -103,6 +107,18 @@ KPM_DESCRIPTION("Trace su-related syscalls of a PID tree (optionally seeded by U
 #endif
 #ifndef __NR_write
 #define __NR_write 64
+#endif
+#ifndef __NR_mkdirat
+#define __NR_mkdirat 34
+#endif
+#ifndef __NR_socket
+#define __NR_socket 198
+#endif
+#ifndef __NR_bind
+#define __NR_bind 200
+#endif
+#ifndef __NR_renameat2
+#define __NR_renameat2 276
 #endif
 #ifndef __NR_sendto
 #define __NR_sendto 206
@@ -840,6 +856,93 @@ static void h_write(hook_fargs3_t *a, void *udata)
 	}
 }
 
+/*
+ * Plain filesystem / socket activity of a normal (non-root) app: file
+ * delete/create/rename, and socket creation + local bind. Always logged
+ * (not gated behind `verbose`) since these are inherently meaningful,
+ * unlike every openat.
+ *
+ * Not visible at this level: permission-gated framework APIs (camera, mic,
+ * location, clipboard, contacts, SMS, ...). Those go through Binder IPC to
+ * system_server, not a plain syscall - seeing them needs a Binder transaction
+ * parser (ioctl on /dev/binder), which this module does not implement.
+ */
+static void h_unlinkat(hook_fargs3_t *a, void *udata)
+{
+	pid_t pid;
+	char fn[SCL_PATH];
+	char d[SCL_PATH + 32];
+
+	if (!is_target(&pid))
+		return;
+	read_path((const char __user *)syscall_argn(a, 1), fn, sizeof(fn));
+	kf_scnprintf(d, sizeof(d), "dfd=%d path=%s", (int)syscall_argn(a, 0), fn);
+	emit(pid, "unlink", d, 0);
+}
+
+static void h_mkdirat(hook_fargs3_t *a, void *udata)
+{
+	pid_t pid;
+	char fn[SCL_PATH];
+	char d[SCL_PATH + 32];
+
+	if (!is_target(&pid))
+		return;
+	read_path((const char __user *)syscall_argn(a, 1), fn, sizeof(fn));
+	kf_scnprintf(d, sizeof(d), "dfd=%d path=%s", (int)syscall_argn(a, 0), fn);
+	emit(pid, "mkdir", d, 0);
+}
+
+/* renameat2(int olddfd, const char *oldpath, int newdfd, const char *newpath, unsigned flags) */
+static void h_renameat2(hook_fargs5_t *a, void *udata)
+{
+	pid_t pid;
+	char from[SCL_PATH];
+	char to[SCL_PATH];
+	char d[SCL_PATH * 2 + 16];
+
+	if (!is_target(&pid))
+		return;
+	read_path((const char __user *)syscall_argn(a, 1), from, sizeof(from));
+	read_path((const char __user *)syscall_argn(a, 3), to, sizeof(to));
+	kf_scnprintf(d, sizeof(d), "from=%s to=%s", from, to);
+	emit(pid, "rename", d, 0);
+}
+
+static void h_socket(hook_fargs3_t *a, void *udata)
+{
+	pid_t pid;
+	char d[64];
+
+	if (!is_target(&pid))
+		return;
+	kf_scnprintf(d, sizeof(d), "family=%ld type=%ld proto=%ld", (long)syscall_argn(a, 0),
+		     (long)syscall_argn(a, 1), (long)syscall_argn(a, 2));
+	emit(pid, "socket", d, 0);
+}
+
+/* bind(int fd, struct sockaddr *addr, int addrlen): the local address a server socket listens on */
+static void h_bind(hook_fargs3_t *a, void *udata)
+{
+	pid_t pid;
+	unsigned char sa[112];
+	char addr[96];
+	char d[140];
+	int len = (int)syscall_argn(a, 2);
+	int fd = (int)syscall_argn(a, 0);
+
+	if (!is_target(&pid))
+		return;
+	if (len < 2 || len > (int)sizeof(sa) ||
+	    ucopy(sa, (const void __user *)syscall_argn(a, 1), (unsigned long)len)) {
+		kf_scnprintf(d, sizeof(d), "fd=%d addr=<unreadable>", fd);
+	} else {
+		fmt_sockaddr(sa, len, addr, sizeof(addr));
+		kf_scnprintf(d, sizeof(d), "fd=%d %s", fd, addr);
+	}
+	emit(pid, "bind", d, 0);
+}
+
 /* connect(int fd, struct sockaddr *uservaddr, int addrlen) */
 static void h_connect(hook_fargs3_t *a, void *udata)
 {
@@ -1043,6 +1146,11 @@ static struct scl_hook hooks[] = {
 	{ __NR_execve, 3, (void *)h_execve, 0, 0 },
 	{ __NR_execveat, 5, (void *)h_execveat, 0, 0 },
 	{ __NR_connect, 3, (void *)h_connect, 0, 0 },
+	{ __NR_unlinkat, 3, (void *)h_unlinkat, 0, 0 },
+	{ __NR_mkdirat, 3, (void *)h_mkdirat, 0, 0 },
+	{ __NR_renameat2, 5, (void *)h_renameat2, 0, 0 },
+	{ __NR_socket, 3, (void *)h_socket, 0, 0 },
+	{ __NR_bind, 3, (void *)h_bind, 0, 0 },
 	{ __NR_sendto, 6, (void *)h_sendto, 0, 0 },
 	{ __NR_write, 3, (void *)h_write, 0, 0 },
 	{ __NR_setuid, 1, (void *)h_setuid, 0, 0 },

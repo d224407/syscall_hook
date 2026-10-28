@@ -94,7 +94,9 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
 
   release:
-    if: github.event.inputs.release == 'true'
+    # Every push to main publishes/updates one rolling release (tag "latest"); a manual
+    # run can additionally publish a separate tagged release via the release/version inputs.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event.inputs.release == 'true')
     needs: [kpm, android]
     runs-on: ubuntu-latest
     permissions:
@@ -106,7 +108,22 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Upload release
+      - name: Upload rolling release (latest)
+        if: github.event_name == 'push'
+        uses: ncipollo/release-action@v1.14.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: latest
+          tag: latest
+          body: Built from the latest commit on main (${{ github.sha }}).
+          artifacts: "dist/*"
+          allowUpdates: true
+          makeLatest: true
+          omitBodyDuringUpdate: false
+          replacesArtifacts: true
+
+      - name: Upload tagged release
+        if: github.event.inputs.release == 'true'
         uses: ncipollo/release-action@v1.14.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

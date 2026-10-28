@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * syscall_logger.c (v0.8.0) - KPM tracing su-related syscalls of a PID tree.
+ * syscall_logger.c (v0.9.0) - KPM tracing su-related syscalls of a PID tree.
  *
  * Logic:
  *  - Tracked set = table of tgids. A process joins if it is listed (add),
@@ -12,9 +12,18 @@
  *    ptrace, mount, clone, exit_group, read(0) (shell stdin, i.e. commands
  *    pushed through a pipe), sendto (DNS query name, UDP:53), write (HTTP
  *    request line + Host, TLS ClientHello SNI, and with `wr 1` the printable
- *    text of any other write, e.g. commands pushed over a pipe fd), unlinkat
+ *    text of any other write, e.g. commands pushed over a pipe fd), sendmsg
+ *    (same HTTP/TLS check as write, for vectored socket I/O), unlinkat
  *    (delete), mkdirat (create dir), renameat2 (move/rename), socket, bind.
  *    "[!]" marks su-like / uid 0 / remount.
+ *  - Crash detection: a native crash on a tracked pid triggers Android's
+ *    tombstone dumper (crash_dump32/64 <pid>), which this module recognizes
+ *    system-wide (not just for tracked processes, since the dumper itself
+ *    isn't one) and reports as event "crash". Java-level crashes (uncaught
+ *    exceptions, ANRs) go through Binder to system_server with no syscall
+ *    signature, so those are not detected.
+ *  - Multi-target: up to 8 uids can be tracked at once (`target+`), each with
+ *    its own pid subtree auto-attached the same way a single target is.
  *  - Not covered: permission-gated framework APIs (camera, mic, location,
  *    clipboard, contacts, SMS, ...) are Binder IPC calls into system_server,
  *    not plain syscalls, so a syscall hook cannot see them.
@@ -42,10 +51,13 @@
  * Control without SuperKey (new APatch verifies the manager signature instead):
  *   as root: readlink '/.scl:<token> <cmd>'  -> answer in dmesg "[SCL]ctl <token> <result>"
  * Commands (that channel, or APatch app: KPM tab -> module Control; also load args):
- *   add <pid> | del <pid> | uid <n> | target <uid> | clear | prune | ping
- *   | hb <0|1> | wr <0|1> | verbose <0|1> | list      (a bare number means pid)
- *   clear  = drop all pids AND the seed uid (uid auto-attach would re-add pids).
- *   target = clear, then auto-attach every process of <uid>.
+ *   add <pid> | del <pid> | uid <n> | target <uid> | target+ <uid> | untarget <uid>
+ *   | clear | prune | ping | hb <0|1> | wr <0|1> | verbose <0|1> | list
+ *   (a bare number means pid)
+ *   clear    = drop all pids AND every seed uid (uid auto-attach would re-add pids).
+ *   target   = clear, then auto-attach every process of <uid> (single-target, replaces).
+ *   target+  = add <uid> to the current set of up to 8 tracked uids, without clearing.
+ *   untarget = stop auto-attaching <uid> (processes already tracked stay until they exit).
  *   ping   = refresh the heartbeat only (same effect as any other command).
  *   Dead pids (killed by signal, no exit_group) are pruned with kill(pid, 0).
  */
@@ -60,7 +72,7 @@
 #include <asm/current.h>
 
 KPM_NAME("syscall_logger");
-KPM_VERSION("0.8.0");
+KPM_VERSION("0.9.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("you");
 KPM_DESCRIPTION("Trace su-related syscalls of a PID tree (optionally seeded by UID)");
@@ -123,6 +135,9 @@ KPM_DESCRIPTION("Trace su-related syscalls of a PID tree (optionally seeded by U
 #ifndef __NR_sendto
 #define __NR_sendto 206
 #endif
+#ifndef __NR_sendmsg
+#define __NR_sendmsg 211
+#endif
 
 #define MAX_TRACK  128 /* power of 2 */
 #define MAX_ARGS   8
@@ -134,7 +149,61 @@ KPM_DESCRIPTION("Trace su-related syscalls of a PID tree (optionally seeded by U
 static volatile pid_t tracked[MAX_TRACK];
 static volatile unsigned int track_next = 0;
 static volatile int track_active = 0; /* table non-empty */
-static volatile uid_t seed_uid = 0;   /* 0 = off */
+#define MAX_SEED_UIDS 8
+static volatile uid_t seed_uids[MAX_SEED_UIDS]; /* 0 = empty slot; multiple apps at once */
+
+static int seed_has(uid_t u)
+{
+	int i;
+
+	if (!u)
+		return 0;
+	for (i = 0; i < MAX_SEED_UIDS; i++)
+		if (seed_uids[i] == u)
+			return 1;
+	return 0;
+}
+
+static int seed_any(void)
+{
+	int i;
+
+	for (i = 0; i < MAX_SEED_UIDS; i++)
+		if (seed_uids[i])
+			return 1;
+	return 0;
+}
+
+static void seed_add(uid_t u)
+{
+	int i;
+
+	if (!u || seed_has(u))
+		return;
+	for (i = 0; i < MAX_SEED_UIDS; i++) {
+		if (!seed_uids[i]) {
+			seed_uids[i] = u;
+			return;
+		}
+	}
+}
+
+static void seed_del(uid_t u)
+{
+	int i;
+
+	for (i = 0; i < MAX_SEED_UIDS; i++)
+		if (seed_uids[i] == u)
+			seed_uids[i] = 0;
+}
+
+static void seed_clear(void)
+{
+	int i;
+
+	for (i = 0; i < MAX_SEED_UIDS; i++)
+		seed_uids[i] = 0;
+}
 static volatile int verbose = 0;      /* 0: log su-like paths only */
 
 /* runtime-resolved kernel funcs */
@@ -370,11 +439,11 @@ static int is_target(pid_t *out_tgid)
 {
 	pid_t tgid, ppid;
 
-	if (!track_active && !seed_uid)
+	if (!track_active && !seed_any())
 		return 0;
-	if (kf_now && hb_enabled && last_ping && (track_active || seed_uid) &&
+	if (kf_now && hb_enabled && last_ping && (track_active || seed_any()) &&
 	    (kf_now() - last_ping) > HEARTBEAT_TIMEOUT) {
-		seed_uid = 0;
+		seed_clear();
 		track_clear();
 		pr_info("[SCL] heartbeat timeout: target auto-cleared (viewer app not responding)\n");
 		return 0;
@@ -384,7 +453,7 @@ static int is_target(pid_t *out_tgid)
 		return 0;
 	if (track_has(tgid))
 		goto yes;
-	if (seed_uid && current_uid() == seed_uid) {
+	if (seed_has(current_uid())) {
 		track_add(tgid);
 		goto yes;
 	}
@@ -549,16 +618,39 @@ static void h_newfstatat(hook_fargs4_t *a, void *udata)
 		   (unsigned long)syscall_argn(a, 3));
 }
 
-static void do_exec(pid_t pid, const char *ev, const char __user *upath,
-		    const char __user *const __user *uargv)
+/*
+ * Native crash detection: on a fatal signal, Android's kernel coredump path
+ * execs /system/bin/crash_dump32|64 <pid> to write a tombstone. That exec is
+ * made by tombstoned/debuggerd, a process we are not tracking - so this check
+ * runs unconditionally on every exec, system-wide, independent of is_target().
+ * The cost is two short basename compares per exec; negligible.
+ */
+static void check_crash_dump(const char *fn, const char *av)
 {
-	char fn[SCL_PATH];
-	char av[320];
+	const char *base = s_base(fn);
+	const char *p;
+	long crashed;
+	char d[48];
+
+	if (!s_eq(base, "crash_dump32") && !s_eq(base, "crash_dump64"))
+		return;
+	/* argv is "crash_dump64 <pid>" (plus a couple of internal flags on some ROMs) */
+	for (p = av; *p && *p != ' '; p++)
+		;
+	while (*p == ' ')
+		p++;
+	crashed = (long)parse_num(p);
+	if (crashed <= 1 || !track_has((pid_t)crashed))
+		return;
+	kf_scnprintf(d, sizeof(d), "dumper=%s", base);
+	pr_info("[SCL][!] pid=%ld uid=0 crash %s\n", crashed, d);
+}
+
+static void do_exec(pid_t pid, const char *ev, const char *fn, const char *av)
+{
 	char d[SCL_PATH + 340];
 	int su;
 
-	read_path(upath, fn, sizeof(fn));
-	read_argv(uargv, av, sizeof(av));
 	su = su_like(fn) || (av[0] && s_eq(s_base(av), "su")) ||
 	     (av[0] && s_has(av, "su -") ) || (av[0] && s_has(av, "/su "));
 	kf_scnprintf(d, sizeof(d), "file=%s argv=%s", fn, av);
@@ -569,22 +661,30 @@ static void do_exec(pid_t pid, const char *ev, const char __user *upath,
 static void h_execve(hook_fargs3_t *a, void *udata)
 {
 	pid_t pid;
+	char fn[SCL_PATH];
+	char av[320];
 
+	read_path((const char __user *)syscall_argn(a, 0), fn, sizeof(fn));
+	read_argv((const char __user *const __user *)syscall_argn(a, 1), av, sizeof(av));
+	check_crash_dump(fn, av);
 	if (!is_target(&pid))
 		return;
-	do_exec(pid, "execve", (const char __user *)syscall_argn(a, 0),
-		(const char __user *const __user *)syscall_argn(a, 1));
+	do_exec(pid, "execve", fn, av);
 }
 
 /* execveat(int dfd, const char *filename, argv, envp, int flags) */
 static void h_execveat(hook_fargs5_t *a, void *udata)
 {
 	pid_t pid;
+	char fn[SCL_PATH];
+	char av[320];
 
+	read_path((const char __user *)syscall_argn(a, 1), fn, sizeof(fn));
+	read_argv((const char __user *const __user *)syscall_argn(a, 2), av, sizeof(av));
+	check_crash_dump(fn, av);
 	if (!is_target(&pid))
 		return;
-	do_exec(pid, "execveat", (const char __user *)syscall_argn(a, 1),
-		(const char __user *const __user *)syscall_argn(a, 2));
+	do_exec(pid, "execveat", fn, av);
 }
 
 /*
@@ -813,6 +913,54 @@ static void h_sendto(hook_fargs6_t *a, void *udata)
 		return;
 	kf_scnprintf(d, sizeof(d), "query=%s", name);
 	emit(pid, "dns", d, 0);
+}
+
+/*
+ * sendmsg(int fd, const struct msghdr *msg, int flags): same HTTP/TLS check as
+ * write(), applied to the first iovec. Many network libraries (okhttp/
+ * conscrypt included) use sendmsg instead of write/send for socket I/O, so
+ * without this hook a lot of HTTP/TLS traffic would be invisible. Assumes the
+ * standard 64-bit msghdr/iovec layout (msg_iov at offset 16, msg_iovlen at
+ * offset 24) - true for bionic/glibc on arm64.
+ */
+static void h_sendmsg(hook_fargs3_t *a, void *udata)
+{
+	pid_t pid;
+	unsigned long hdr[7];
+	unsigned long iov[2];
+	unsigned char buf[SCL_NET_BUF];
+	char host[128];
+	char line[220];
+	char d[320];
+	long len;
+	int fd = (int)syscall_argn(a, 0);
+
+	if (!is_target(&pid))
+		return;
+	if (ucopy(hdr, (const void __user *)syscall_argn(a, 1), sizeof(hdr)))
+		return;
+	if (hdr[3] < 1) /* msg_iovlen */
+		return;
+	if (ucopy(iov, (const void __user *)hdr[2], sizeof(iov))) /* first iovec */
+		return;
+	len = (long)iov[1];
+	if (len < 16)
+		return;
+	if (len > (long)sizeof(buf))
+		len = (long)sizeof(buf);
+	if (ucopy(buf, (const void __user *)iov[0], (unsigned long)len))
+		return;
+
+	if (is_http_method(buf, (int)len)) {
+		http_summarize(buf, (int)len, line, sizeof(line));
+		kf_scnprintf(d, sizeof(d), "fd=%d %s", fd, line);
+		emit(pid, "http", d, 0);
+		return;
+	}
+	if (tls_sni(buf, (int)len, host, sizeof(host))) {
+		kf_scnprintf(d, sizeof(d), "fd=%d sni=%s", fd, host);
+		emit(pid, "tls", d, 0);
+	}
 }
 
 /* write(int fd, const void *buf, size_t count): plaintext HTTP or TLS ClientHello only */
@@ -1152,6 +1300,7 @@ static struct scl_hook hooks[] = {
 	{ __NR_socket, 3, (void *)h_socket, 0, 0 },
 	{ __NR_bind, 3, (void *)h_bind, 0, 0 },
 	{ __NR_sendto, 6, (void *)h_sendto, 0, 0 },
+	{ __NR_sendmsg, 3, (void *)h_sendmsg, 0, 0 },
 	{ __NR_write, 3, (void *)h_write, 0, 0 },
 	{ __NR_setuid, 1, (void *)h_setuid, 0, 0 },
 	{ __NR_setreuid, 2, (void *)h_setreuid, 0, 0 },
@@ -1201,12 +1350,16 @@ static void run_cmd(const char *args, char *echo, int cap)
 	} else if ((r = s_prefix(args, "del "))) {
 		track_del((pid_t)parse_num(r));
 	} else if (s_prefix(args, "clear")) {
-		seed_uid = 0; /* stop uid auto-attach first, otherwise it re-adds pids */
+		seed_clear(); /* stop uid auto-attach first, otherwise it re-adds pids */
 		track_clear();
+	} else if ((r = s_prefix(args, "target+ "))) {
+		seed_add((uid_t)parse_num(r)); /* add a uid to the current multi-target set */
+	} else if ((r = s_prefix(args, "untarget "))) {
+		seed_del((uid_t)parse_num(r));
 	} else if ((r = s_prefix(args, "target "))) {
-		seed_uid = 0;
+		seed_clear();
 		track_clear();
-		seed_uid = (uid_t)parse_num(r);
+		seed_add((uid_t)parse_num(r));
 	} else if (s_prefix(args, "prune")) {
 		track_prune();
 	} else if ((r = s_prefix(args, "hb "))) {
@@ -1214,7 +1367,7 @@ static void run_cmd(const char *args, char *echo, int cap)
 	} else if ((r = s_prefix(args, "wr "))) {
 		wr_mode = parse_num(r) ? 1 : 0;
 	} else if ((r = s_prefix(args, "uid "))) {
-		seed_uid = (uid_t)parse_num(r);
+		seed_add((uid_t)parse_num(r));
 	} else if ((r = s_prefix(args, "verbose "))) {
 		verbose = parse_num(r) ? 1 : 0;
 	} else if (!s_prefix(args, "list")) {
@@ -1225,8 +1378,23 @@ static void run_cmd(const char *args, char *echo, int cap)
 	for (i = 0; i < MAX_TRACK; i++)
 		if (tracked[i])
 			n++;
-	kf_scnprintf(tmp, sizeof(tmp), "uid=%u verbose=%d n=%d hb=%s wr=%s pids:",
-		     (unsigned int)seed_uid, (int)verbose, n,
+	len = s_append(echo, cap, len, "uids=");
+	{
+		int ui, first = 1;
+
+		for (ui = 0; ui < MAX_SEED_UIDS; ui++) {
+			if (!seed_uids[ui])
+				continue;
+			if (!first)
+				len = s_append(echo, cap, len, ",");
+			kf_scnprintf(tmp, sizeof(tmp), "%u", (unsigned int)seed_uids[ui]);
+			len = s_append(echo, cap, len, tmp);
+			first = 0;
+		}
+		if (first)
+			len = s_append(echo, cap, len, "-");
+	}
+	kf_scnprintf(tmp, sizeof(tmp), " verbose=%d n=%d hb=%s wr=%s pids:", (int)verbose, n,
 		     !kf_now ? "unsupported" : (hb_enabled ? "on" : "off"), wr_mode ? "on" : "off");
 	len = s_append(echo, cap, len, tmp);
 	for (i = 0; i < MAX_TRACK; i++) {
@@ -1320,7 +1488,7 @@ static long syscall_logger_control(const char *args, char *__user out_msg, int o
 static long syscall_logger_exit(void *__user reserved)
 {
 	/* stop events first, then unhook */
-	seed_uid = 0;
+	seed_clear();
 	last_ping = 0;
 	track_clear();
 	unhook_all();

@@ -11,20 +11,27 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -35,6 +42,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
@@ -93,7 +102,7 @@ class MainActivity : ComponentActivity() {
 
 private sealed class Screen {
     object Picker : Screen()
-    data class Log(val label: String?, val uid: Int, val fresh: Boolean) : Screen()
+    data class Log(val labels: List<String>, val uids: List<Int>, val fresh: Boolean) : Screen()
 }
 
 private class AppEntry(val label: String, val pkg: String, val uid: Int, val system: Boolean)
@@ -107,7 +116,7 @@ private fun AppRoot() {
             SmallTopAppBar(
                 title = when (val s = screen) {
                     Screen.Picker -> "SCL Viewer"
-                    is Screen.Log -> s.label ?: "All tracked processes"
+                    is Screen.Log -> if (s.labels.size == 1) s.labels[0] else "${s.uids.size} apps"
                 },
                 navigationIcon = {
                     if (screen is Screen.Log) {
@@ -121,10 +130,10 @@ private fun AppRoot() {
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
             when (val s = screen) {
-                Screen.Picker -> PickerScreen(onPick = { label, uid ->
-                    screen = Screen.Log(label, uid, fresh = true)
+                Screen.Picker -> PickerScreen(onPick = { labels, uids ->
+                    screen = Screen.Log(labels, uids, fresh = true)
                 })
-                is Screen.Log -> LogScreen(label = s.label, uid = s.uid, fresh = s.fresh)
+                is Screen.Log -> LogScreen(labels = s.labels, uids = s.uids, fresh = s.fresh)
             }
         }
     }
@@ -135,7 +144,7 @@ private fun AppRoot() {
 // ---------------------------------------------------------------------------------------------
 
 @Composable
-private fun PickerScreen(onPick: (String, Int) -> Unit) {
+private fun PickerScreen(onPick: (List<String>, List<Int>) -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -144,6 +153,7 @@ private fun PickerScreen(onPick: (String, Int) -> Unit) {
     var query by remember { mutableStateOf("") }
     var showSystem by remember { mutableStateOf(Prefs.showSystem(ctx)) }
     var showSettings by remember { mutableStateOf(false) }
+    val selected = remember { mutableStateListOf<String>() } // selected package names
 
     fun refreshStatus() {
         scope.launch {
@@ -178,7 +188,12 @@ private fun PickerScreen(onPick: (String, Int) -> Unit) {
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(status, style = MiuixTheme.textStyles.body2, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+            Text(
+                status,
+                style = MiuixTheme.textStyles.body2,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                modifier = Modifier.weight(1f)
+            )
             IconButton(onClick = { showSettings = true }) {
                 Icon(MiuixIcons.Settings, contentDescription = "Settings")
             }
@@ -203,19 +218,56 @@ private fun PickerScreen(onPick: (String, Int) -> Unit) {
             )
         }
 
-        LazyColumn(Modifier.fillMaxSize()) {
+        LazyColumn(Modifier.fillMaxSize().weight(1f)) {
             items(shown, key = { it.pkg }) { entry ->
-                AppRow(entry, onClick = {
-                    scope.launch {
-                        status = "Setting target ${entry.label}..."
-                        val r = withContext(Dispatchers.IO) { ModuleCtl.send(ctx, "target ${entry.uid}") }
-                        if (r.ok) {
-                            onPick(entry.label, entry.uid)
+                AppRow(
+                    entry,
+                    checked = selected.contains(entry.pkg),
+                    onCheckedChange = { c ->
+                        if (c) {
+                            if (!selected.contains(entry.pkg)) selected.add(entry.pkg)
                         } else {
-                            status = r.error ?: "failed"
+                            selected.remove(entry.pkg)
+                        }
+                    },
+                    onClick = {
+                        scope.launch {
+                            status = "Setting target ${entry.label}..."
+                            val r = withContext(Dispatchers.IO) { ModuleCtl.send(ctx, "target ${entry.uid}") }
+                            if (r.ok) {
+                                onPick(listOf(entry.label), listOf(entry.uid))
+                            } else {
+                                status = r.error ?: "failed"
+                            }
                         }
                     }
-                })
+                )
+            }
+        }
+
+        if (selected.isNotEmpty()) {
+            val picked = allApps.filter { selected.contains(it.pkg) }
+            Row(
+                Modifier.fillMaxWidth().padding(16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("${picked.size} selected", style = MiuixTheme.textStyles.body1)
+                TextButton(
+                    text = "Trace selected",
+                    colors = ButtonDefaults.textButtonColorsPrimary(),
+                    onClick = {
+                        scope.launch {
+                            status = "Setting ${picked.size} targets..."
+                            withContext(Dispatchers.IO) { ModuleCtl.send(ctx, "clear") }
+                            picked.forEachIndexed { i, e ->
+                                val cmd = if (i == 0) "target ${e.uid}" else "target+ ${e.uid}"
+                                withContext(Dispatchers.IO) { ModuleCtl.send(ctx, cmd) }
+                            }
+                            onPick(picked.map { it.label }, picked.map { it.uid })
+                        }
+                    }
+                )
             }
         }
     }
@@ -229,7 +281,7 @@ private fun PickerScreen(onPick: (String, Int) -> Unit) {
 }
 
 @Composable
-private fun AppRow(entry: AppEntry, onClick: () -> Unit) {
+private fun AppRow(entry: AppEntry, checked: Boolean, onCheckedChange: (Boolean) -> Unit, onClick: () -> Unit) {
     val ctx = LocalContext.current
     var bitmap by remember(entry.pkg) { mutableStateOf<Bitmap?>(null) }
 
@@ -243,6 +295,24 @@ private fun AppRow(entry: AppEntry, onClick: () -> Unit) {
         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
+        Box(
+            Modifier
+                .size(24.dp)
+                .background(
+                    if (checked) MiuixTheme.colorScheme.primary else MiuixTheme.colorScheme.surfaceVariant,
+                    RoundedCornerShape(6.dp)
+                )
+                .clickable { onCheckedChange(!checked) },
+            contentAlignment = Alignment.Center
+        ) {
+            if (checked) {
+                Box(
+                    Modifier.size(10.dp)
+                        .background(MiuixTheme.colorScheme.onPrimary, RoundedCornerShape(2.dp))
+                )
+            }
+        }
+        Spacer(Modifier.size(8.dp))
         Box(Modifier.size(40.dp), contentAlignment = Alignment.Center) {
             val b = bitmap
             if (b != null) {
@@ -332,12 +402,12 @@ private fun SettingsDialog(show: Boolean, onDismiss: () -> Unit) {
 // "su" is a virtual filter (matches the [!] alert marker); the rest match " <event> " as
 // emitted by the module (see emit() in syscall_logger.c).
 private val EVENT_FILTERS = listOf(
-    "su", "execve", "connect", "setuid", "ptrace", "mount",
+    "crash", "su", "execve", "connect", "setuid", "ptrace", "mount",
     "stdin", "write", "unlink", "mkdir", "rename", "socket", "bind", "dns", "http", "tls", "fork", "exit"
 )
 
 @Composable
-private fun LogScreen(label: String?, uid: Int, fresh: Boolean) {
+private fun LogScreen(labels: List<String>, uids: List<Int>, fresh: Boolean) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -351,6 +421,7 @@ private fun LogScreen(label: String?, uid: Int, fresh: Boolean) {
     var autoTimeout by remember { mutableStateOf(Prefs.autoTimeout(ctx)) }
     var logWrites by remember { mutableStateOf(Prefs.logWrites(ctx)) }
     var filterRevision by remember { mutableStateOf(0) }
+    var scrubFraction by remember(uids) { mutableStateOf(1f) } // 1f = live (tail of the log)
 
     fun matchesFilters(l: String): Boolean {
         val active = EVENT_FILTERS.filter { activeFilters[it] == true }
@@ -358,9 +429,15 @@ private fun LogScreen(label: String?, uid: Int, fresh: Boolean) {
         return active.any { f -> if (f == "su") l.contains("[!]") else l.contains(" $f ") }
     }
 
-    val shown = remember(allLines, query, filterRevision) {
+    val filtered = remember(allLines, query, filterRevision) {
         allLines.filter { matchesFilters(it) && (query.isEmpty() || it.contains(query, ignoreCase = true)) }
     }
+    val windowSize = 400
+    val maxStart = (filtered.size - windowSize).coerceAtLeast(0)
+    val live = scrubFraction >= 0.999f
+    val windowStart = if (live) maxStart else (scrubFraction * maxStart).toInt().coerceIn(0, maxStart)
+    val shown = if (filtered.size <= windowSize) filtered
+        else filtered.subList(windowStart, (windowStart + windowSize).coerceAtMost(filtered.size))
 
     suspend fun pushHeartbeat() {
         withContext(Dispatchers.IO) {
@@ -372,7 +449,7 @@ private fun LogScreen(label: String?, uid: Int, fresh: Boolean) {
     // Poll dmesg once a second; ping every 5s while autoTimeout is on, to keep the module's
     // target alive (see "Heartbeat" in syscall_logger.c). Leaving this screen stops both,
     // and the module clears the target itself after a few seconds of silence.
-    LaunchedEffect(uid) {
+    LaunchedEffect(uids) {
         pushHeartbeat()
         var tick = 0
         while (true) {
@@ -507,6 +584,29 @@ private fun LogScreen(label: String?, uid: Int, fresh: Boolean) {
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
         )
 
+        if (filtered.size > windowSize) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    if (live) "Live - showing newest $windowSize of ${filtered.size}"
+                    else "Paused - showing ${windowStart + 1}-${(windowStart + windowSize).coerceAtMost(filtered.size)} of ${filtered.size}",
+                    style = MiuixTheme.textStyles.body2,
+                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    modifier = Modifier.weight(1f)
+                )
+                if (!live) {
+                    TextButton(text = "Live", onClick = { scrubFraction = 1f })
+                }
+            }
+            ScrubBar(
+                fraction = scrubFraction,
+                onFractionChange = { scrubFraction = it },
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+            )
+        }
+
         Card(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
             SwitchPreference(
                 title = "Auto timeout",
@@ -544,9 +644,39 @@ private fun LogScreen(label: String?, uid: Int, fresh: Boolean) {
     }
 }
 
+/** Horizontal scrub bar: drag to look back through the buffered log without losing the live
+ * tail. Dragging all the way right returns to live-follow mode. */
+@Composable
+private fun ScrubBar(fraction: Float, onFractionChange: (Float) -> Unit, modifier: Modifier = Modifier) {
+    var widthPx by remember { mutableStateOf(1) }
+    Box(
+        modifier
+            .fillMaxWidth()
+            .height(28.dp)
+            .onSizeChanged { widthPx = it.width.coerceAtLeast(1) }
+            .background(MiuixTheme.colorScheme.surfaceVariant, RoundedCornerShape(14.dp))
+            .pointerInput(Unit) {
+                detectDragGestures(
+                    onDragStart = { offset -> onFractionChange((offset.x / widthPx).coerceIn(0f, 1f)) }
+                ) { change, _ ->
+                    change.consume()
+                    onFractionChange((change.position.x / widthPx).coerceIn(0f, 1f))
+                }
+            }
+    ) {
+        Box(
+            Modifier
+                .fillMaxHeight()
+                .fillMaxWidth(fraction.coerceIn(0.03f, 1f))
+                .background(MiuixTheme.colorScheme.primary, RoundedCornerShape(14.dp))
+        )
+    }
+}
+
 @Composable
 private fun lineColor(l: String): Color = when {
     l.contains("[!]") -> Color(0xFFE53935)
+    l.contains(" crash ") -> Color(0xFFC2185B)
     l.contains(" execve ") || l.contains(" execveat ") -> Color(0xFF1E88E5)
     l.contains(" connect ") -> Color(0xFF43A047)
     l.contains(" stdin ") -> Color(0xFFFB8C00)

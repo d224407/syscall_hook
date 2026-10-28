@@ -1,8 +1,8 @@
 {
     "metamodule": false,
     "summary": {
-        "en": "Traces syscalls of a target PID tree: su activity, exec argv, network (connect/DNS/HTTP/TLS SNI), file create/delete/rename, sockets, shell stdin, optional write payloads",
-        "vi": "Theo dõi syscall của cây PID mục tiêu: hoạt động su, argv, mạng (connect/DNS/HTTP/TLS SNI), tạo/xoá/đổi tên file, socket, stdin shell, tuỳ chọn ghi nội dung write"
+        "en": "Traces syscalls of up to 8 target apps at once: su activity, exec argv, network (connect/DNS/HTTP/TLS SNI incl. sendmsg), file create/delete/rename, sockets, shell stdin, native crashes",
+        "vi": "Theo dõi syscall của tối đa 8 app cùng lúc: hoạt động su, argv, mạng (connect/DNS/HTTP/TLS SNI, gồm sendmsg), tạo/xoá/đổi tên file, socket, stdin shell, crash native"
     },
     "modulename": "Syscall Logger",
     "authors": [
@@ -10,7 +10,7 @@
     ],
     "license": "GPL-2.0-only",
     "moduleid": "syscall_logger",
-    "version": "0.8.0",
-    "VersionCode": 8,
+    "version": "0.9.0",
+    "VersionCode": 9,
     "downloadUrl": ""
 }

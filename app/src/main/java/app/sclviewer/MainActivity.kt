@@ -10,12 +10,14 @@ import android.graphics.Bitmap
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,9 +26,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
@@ -37,17 +43,28 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.sp
 import androidx.core.graphics.drawable.toBitmap
 import kotlinx.coroutines.Dispatchers
@@ -421,7 +438,16 @@ private fun LogScreen(labels: List<String>, uids: List<Int>, fresh: Boolean) {
     var autoTimeout by remember { mutableStateOf(Prefs.autoTimeout(ctx)) }
     var logWrites by remember { mutableStateOf(Prefs.logWrites(ctx)) }
     var filterRevision by remember { mutableStateOf(0) }
-    var scrubFraction by remember(uids) { mutableStateOf(1f) } // 1f = live (tail of the log)
+
+    // Scroll behaviour: follow the tail while the user is at the bottom, stop following as soon
+    // as they scroll up, resume once they are back at the bottom (or tap "Latest").
+    var followTail by remember { mutableStateOf(true) }
+    // Controls panel collapses when the user scrolls/drags up, comes back when they go down.
+    var headerVisible by remember { mutableStateOf(true) }
+    // Counter bumped on every user scroll/drag; restarts the idle timer that hides the thumb.
+    var thumbPing by remember { mutableStateOf(0) }
+    var thumbVisible by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
 
     fun matchesFilters(l: String): Boolean {
         val active = EVENT_FILTERS.filter { activeFilters[it] == true }
@@ -429,15 +455,9 @@ private fun LogScreen(labels: List<String>, uids: List<Int>, fresh: Boolean) {
         return active.any { f -> if (f == "su") l.contains("[!]") else l.contains(" $f ") }
     }
 
-    val filtered = remember(allLines, query, filterRevision) {
+    val shown = remember(allLines, query, filterRevision) {
         allLines.filter { matchesFilters(it) && (query.isEmpty() || it.contains(query, ignoreCase = true)) }
     }
-    val windowSize = 400
-    val maxStart = (filtered.size - windowSize).coerceAtLeast(0)
-    val live = scrubFraction >= 0.999f
-    val windowStart = if (live) maxStart else (scrubFraction * maxStart).toInt().coerceIn(0, maxStart)
-    val shown = if (filtered.size <= windowSize) filtered
-        else filtered.subList(windowStart, (windowStart + windowSize).coerceAtMost(filtered.size))
 
     suspend fun pushHeartbeat() {
         withContext(Dispatchers.IO) {
@@ -495,6 +515,43 @@ private fun LogScreen(labels: List<String>, uids: List<Int>, fresh: Boolean) {
         }
     }
 
+    // New lines while following -> jump to the newest one. Programmatic scrolling does not go
+    // through nested scroll, so it never counts as the user interrupting.
+    LaunchedEffect(shown.size) {
+        if (followTail && shown.isNotEmpty()) listState.scrollToItem(shown.size - 1)
+    }
+
+    // Back at the very bottom (by scrolling or dragging) -> resume following.
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.canScrollForward }.collect { canForward ->
+            if (!canForward) followTail = true
+        }
+    }
+
+    // Thumb is shown on user scroll/drag and hides again after ~1.2s of stillness.
+    LaunchedEffect(thumbPing) {
+        if (thumbPing > 0) {
+            thumbVisible = true
+            delay(1200)
+            thumbVisible = false
+        }
+    }
+
+    val scrollConnection = remember {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (available.y < -4f) {
+                    headerVisible = false // finger moving up -> hide the controls
+                } else if (available.y > 4f) {
+                    headerVisible = true // finger moving down -> show them again
+                    followTail = false // looking at older lines -> stop following
+                }
+                if (available.y != 0f) thumbPing++
+                return Offset.Zero
+            }
+        }
+    }
+
     fun moduleCmd(cmd: String) {
         scope.launch {
             val r = withContext(Dispatchers.IO) { ModuleCtl.send(ctx, cmd) }
@@ -507,168 +564,207 @@ private fun LogScreen(labels: List<String>, uids: List<Int>, fresh: Boolean) {
         return if (text.length > 200_000) text.substring(text.length - 200_000) else text
     }
 
+    val headerProgress by animateFloatAsState(if (headerVisible) 1f else 0f, label = "header")
+    val thumbAlpha by animateFloatAsState(if (thumbVisible) 1f else 0f, label = "thumb")
+
     Column(Modifier.fillMaxSize()) {
-        Text(
-            status,
-            style = MiuixTheme.textStyles.body2,
-            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
-        )
-
-        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            IconButton(onClick = { paused = !paused }) {
-                Icon(MiuixIcons.Refresh, contentDescription = if (paused) "Resume" else "Pause")
-            }
-            IconButton(onClick = { moduleCmd("clear") }) {
-                Icon(MiuixIcons.Back, contentDescription = "Stop target")
-            }
-            IconButton(onClick = {
-                val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                val path = "/sdcard/Download/scl_$ts.log"
-                val text = shownText()
-                scope.launch {
-                    if (text.isEmpty()) {
-                        status = "Nothing to export"
-                    } else {
-                        val res = withContext(Dispatchers.IO) { Su.runWithInput("cat > $path", text) }
-                        status = if (res.rc == 0) "Saved ${shown.size} lines to $path" else "Export failed: ${res.err.trim()}"
-                    }
+        // ---- collapsible controls panel --------------------------------------------------
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .clipToBounds()
+                .layout { measurable, constraints ->
+                    val placeable = measurable.measure(constraints.copy(maxHeight = Constraints.Infinity))
+                    val h = (placeable.height * headerProgress).toInt()
+                    layout(placeable.width, h) { placeable.placeRelative(0, h - placeable.height) }
                 }
-            }) {
-                Icon(MiuixIcons.Download, contentDescription = "Export")
-            }
-            IconButton(onClick = {
-                val i = Intent(Intent.ACTION_SEND).apply {
-                    type = "text/plain"
-                    putExtra(Intent.EXTRA_TEXT, shownText())
-                }
-                ctx.startActivity(Intent.createChooser(i, "Share log"))
-            }) {
-                Icon(MiuixIcons.Share, contentDescription = "Share")
-            }
-            IconButton(onClick = {
-                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                cm.setPrimaryClip(ClipData.newPlainText("scl", shownText()))
-            }) {
-                Icon(MiuixIcons.Copy, contentDescription = "Copy")
-            }
-        }
-
-        // Vertical multi-select popup instead of a horizontally-scrolling chip row.
-        val filterEntry = DropdownEntry(
-            items = EVENT_FILTERS.map { f ->
-                DropdownItem(
-                    text = f,
-                    selected = activeFilters[f] == true,
-                    onClick = {
-                        activeFilters[f] = activeFilters[f] != true
-                        filterRevision++
-                    }
-                )
-            }
-        )
-        val activeCount = EVENT_FILTERS.count { activeFilters[it] == true }
-        OverlayDropdownMenu(
-            title = "Filter",
-            summary = if (activeCount == 0) "All events" else "$activeCount selected",
-            entry = filterEntry,
-            collapseOnSelection = false,
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
-        )
-
-        TextField(
-            value = query,
-            onValueChange = { query = it },
-            label = "Text filter",
-            leadingIcon = { Icon(MiuixIcons.Search, contentDescription = null, modifier = Modifier.padding(start = 12.dp)) },
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
-        )
-
-        if (filtered.size > windowSize) {
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+        ) {
+            Column(Modifier.fillMaxWidth()) {
                 Text(
-                    if (live) "Live - showing newest $windowSize of ${filtered.size}"
-                    else "Paused - showing ${windowStart + 1}-${(windowStart + windowSize).coerceAtMost(filtered.size)} of ${filtered.size}",
+                    status,
                     style = MiuixTheme.textStyles.body2,
                     color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
                 )
-                if (!live) {
-                    TextButton(text = "Live", onClick = { scrubFraction = 1f })
+
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    IconButton(onClick = { paused = !paused }) {
+                        Icon(MiuixIcons.Refresh, contentDescription = if (paused) "Resume" else "Pause")
+                    }
+                    IconButton(onClick = { moduleCmd("clear") }) {
+                        Icon(MiuixIcons.Back, contentDescription = "Stop target")
+                    }
+                    IconButton(onClick = {
+                        val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                        val path = "/sdcard/Download/scl_$ts.log"
+                        val text = shownText()
+                        scope.launch {
+                            if (text.isEmpty()) {
+                                status = "Nothing to export"
+                            } else {
+                                val res = withContext(Dispatchers.IO) { Su.runWithInput("cat > $path", text) }
+                                status = if (res.rc == 0) "Saved ${shown.size} lines to $path" else "Export failed: ${res.err.trim()}"
+                            }
+                        }
+                    }) {
+                        Icon(MiuixIcons.Download, contentDescription = "Export")
+                    }
+                    IconButton(onClick = {
+                        val i = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_TEXT, shownText())
+                        }
+                        ctx.startActivity(Intent.createChooser(i, "Share log"))
+                    }) {
+                        Icon(MiuixIcons.Share, contentDescription = "Share")
+                    }
+                    IconButton(onClick = {
+                        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        cm.setPrimaryClip(ClipData.newPlainText("scl", shownText()))
+                    }) {
+                        Icon(MiuixIcons.Copy, contentDescription = "Copy")
+                    }
+                }
+
+                // Vertical multi-select popup instead of a horizontally-scrolling chip row.
+                val filterEntry = DropdownEntry(
+                    items = EVENT_FILTERS.map { f ->
+                        DropdownItem(
+                            text = f,
+                            selected = activeFilters[f] == true,
+                            onClick = {
+                                activeFilters[f] = activeFilters[f] != true
+                                filterRevision++
+                            }
+                        )
+                    }
+                )
+                val activeCount = EVENT_FILTERS.count { activeFilters[it] == true }
+                OverlayDropdownMenu(
+                    title = "Filter",
+                    summary = if (activeCount == 0) "All events" else "$activeCount selected",
+                    entry = filterEntry,
+                    collapseOnSelection = false,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+
+                TextField(
+                    value = query,
+                    onValueChange = { query = it },
+                    label = "Text filter",
+                    leadingIcon = { Icon(MiuixIcons.Search, contentDescription = null, modifier = Modifier.padding(start = 12.dp)) },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)
+                )
+
+                Card(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+                    SwitchPreference(
+                        title = "Auto timeout",
+                        summary = "Module forgets the target after a few seconds without this screen open",
+                        checked = autoTimeout,
+                        onCheckedChange = {
+                            autoTimeout = it
+                            Prefs.setAutoTimeout(ctx, it)
+                            scope.launch { pushHeartbeat() }
+                        }
+                    )
+                    SwitchPreference(
+                        title = "Log writes",
+                        summary = "Also log printable write() payloads (noisy)",
+                        checked = logWrites,
+                        onCheckedChange = {
+                            logWrites = it
+                            Prefs.setLogWrites(ctx, it)
+                            scope.launch { pushHeartbeat() }
+                        }
+                    )
                 }
             }
-            ScrubBar(
-                fraction = scrubFraction,
-                onFractionChange = { scrubFraction = it },
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
-            )
         }
 
-        Card(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-            SwitchPreference(
-                title = "Auto timeout",
-                summary = "Module forgets the target after a few seconds without this screen open",
-                checked = autoTimeout,
-                onCheckedChange = {
-                    autoTimeout = it
-                    Prefs.setAutoTimeout(ctx, it)
-                    scope.launch { pushHeartbeat() }
+        // ---- log list + right-edge slider -------------------------------------------------
+        Box(Modifier.weight(1f).fillMaxWidth().nestedScroll(scrollConnection)) {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(start = 8.dp, end = 12.dp)) {
+                items(shown) { line ->
+                    Text(
+                        line.replace("[SCL]", ""),
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        color = lineColor(line),
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                    )
                 }
-            )
-            SwitchPreference(
-                title = "Log writes",
-                summary = "Also log printable write() payloads (noisy)",
-                checked = logWrites,
-                onCheckedChange = {
-                    logWrites = it
-                    Prefs.setLogWrites(ctx, it)
-                    scope.launch { pushHeartbeat() }
-                }
-            )
-        }
+            }
 
-        LazyColumn(Modifier.fillMaxSize().padding(horizontal = 8.dp)) {
-            items(shown) { line ->
-                Text(
-                    line.replace("[SCL]", ""),
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp,
-                    color = lineColor(line),
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+            ScrollThumb(
+                listState = listState,
+                count = shown.size,
+                alpha = thumbAlpha,
+                onDrag = { fraction, dy ->
+                    thumbPing++
+                    if (dy < -2f) headerVisible = false else if (dy > 2f) headerVisible = true
+                    if (shown.isNotEmpty()) {
+                        val idx = (fraction * (shown.size - 1)).toInt().coerceIn(0, shown.size - 1)
+                        followTail = idx >= shown.size - 2
+                        scope.launch { listState.scrollToItem(idx) }
+                    }
+                }
+            )
+
+            if (!followTail) {
+                TextButton(
+                    text = "Latest",
+                    colors = ButtonDefaults.textButtonColorsPrimary(),
+                    onClick = {
+                        followTail = true
+                        if (shown.isNotEmpty()) scope.launch { listState.scrollToItem(shown.size - 1) }
+                    },
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp)
                 )
             }
         }
     }
 }
 
-/** Horizontal scrub bar: drag to look back through the buffered log without losing the live
- * tail. Dragging all the way right returns to live-follow mode. */
+/**
+ * Slider on the right edge of the log: thumb position follows the list, dragging it jumps
+ * through the log. Fades out when idle (see thumbAlpha); while invisible it does not intercept
+ * touches, so the list scrolls normally at the edge.
+ */
 @Composable
-private fun ScrubBar(fraction: Float, onFractionChange: (Float) -> Unit, modifier: Modifier = Modifier) {
-    var widthPx by remember { mutableStateOf(1) }
+private fun BoxScope.ScrollThumb(
+    listState: LazyListState,
+    count: Int,
+    alpha: Float,
+    onDrag: (fraction: Float, dy: Float) -> Unit
+) {
+    var heightPx by remember { mutableStateOf(1) }
+    val thumbPx = with(LocalDensity.current) { 56.dp.roundToPx() }
+    val fraction = if (count <= 1) 0f else (listState.firstVisibleItemIndex.toFloat() / (count - 1)).coerceIn(0f, 1f)
+    val active = alpha > 0.05f
+
     Box(
-        modifier
-            .fillMaxWidth()
-            .height(28.dp)
-            .onSizeChanged { widthPx = it.width.coerceAtLeast(1) }
-            .background(MiuixTheme.colorScheme.surfaceVariant, RoundedCornerShape(14.dp))
-            .pointerInput(Unit) {
-                detectDragGestures(
-                    onDragStart = { offset -> onFractionChange((offset.x / widthPx).coerceIn(0f, 1f)) }
-                ) { change, _ ->
-                    change.consume()
-                    onFractionChange((change.position.x / widthPx).coerceIn(0f, 1f))
-                }
-            }
+        Modifier
+            .align(Alignment.CenterEnd)
+            .fillMaxHeight()
+            .width(28.dp)
+            .onSizeChanged { heightPx = it.height.coerceAtLeast(1) }
+            .then(
+                if (active) Modifier.pointerInput(count) {
+                    detectVerticalDragGestures { change, dy ->
+                        change.consume()
+                        onDrag((change.position.y / heightPx).coerceIn(0f, 1f), dy)
+                    }
+                } else Modifier
+            )
     ) {
         Box(
             Modifier
-                .fillMaxHeight()
-                .fillMaxWidth(fraction.coerceIn(0.03f, 1f))
-                .background(MiuixTheme.colorScheme.primary, RoundedCornerShape(14.dp))
+                .align(Alignment.TopEnd)
+                .offset { IntOffset(0, (fraction * (heightPx - thumbPx).coerceAtLeast(0)).toInt()) }
+                .width(6.dp)
+                .height(56.dp)
+                .graphicsLayer { this.alpha = alpha }
+                .background(MiuixTheme.colorScheme.primary, RoundedCornerShape(3.dp))
         )
     }
 }

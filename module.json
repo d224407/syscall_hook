@@ -1,8 +1,8 @@
 {
     "metamodule": false,
     "summary": {
-        "en": "Traces syscalls of up to 8 target apps at once: su activity, exec argv, network (connect/DNS/HTTP/TLS SNI incl. sendmsg), file create/delete/rename, sockets, shell stdin, native crashes",
-        "vi": "Theo dõi syscall của tối đa 8 app cùng lúc: hoạt động su, argv, mạng (connect/DNS/HTTP/TLS SNI, gồm sendmsg), tạo/xoá/đổi tên file, socket, stdin shell, crash native"
+        "en": "Traces syscalls of up to 8 target apps and what they spawn: su/exec, network (connect, DNS, HTTP, TLS SNI), file changes, sockets, shell stdin, native crashes",
+        "vi": "Theo dõi syscall của tối đa 8 app và tiến trình con: su/exec, mạng (connect, DNS, HTTP, TLS SNI), thay đổi file, socket, stdin shell, crash native"
     },
     "modulename": "Syscall Logger",
     "authors": [
@@ -10,7 +10,7 @@
     ],
     "license": "GPL-2.0-only",
     "moduleid": "syscall_logger",
-    "version": "0.9.0",
-    "VersionCode": 9,
+    "version": "0.10.0",
+    "VersionCode": 10,
     "downloadUrl": ""
 }

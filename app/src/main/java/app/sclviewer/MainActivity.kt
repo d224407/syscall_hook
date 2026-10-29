@@ -86,7 +86,6 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.icon.extended.Copy
 import top.yukonga.miuix.kmp.icon.extended.Download
-import top.yukonga.miuix.kmp.icon.extended.Refresh
 import top.yukonga.miuix.kmp.icon.extended.Search
 import top.yukonga.miuix.kmp.icon.extended.Settings
 import top.yukonga.miuix.kmp.icon.extended.Share
@@ -119,7 +118,7 @@ class MainActivity : ComponentActivity() {
 
 private sealed class Screen {
     object Picker : Screen()
-    data class Log(val labels: List<String>, val uids: List<Int>, val fresh: Boolean) : Screen()
+    data class Log(val labels: List<String>, val uids: List<Int>) : Screen()
 }
 
 private class AppEntry(val label: String, val pkg: String, val uid: Int, val system: Boolean)
@@ -148,9 +147,9 @@ private fun AppRoot() {
         Box(modifier = Modifier.fillMaxSize().padding(top = padding.calculateTopPadding())) {
             when (val s = screen) {
                 Screen.Picker -> PickerScreen(onPick = { labels, uids ->
-                    screen = Screen.Log(labels, uids, fresh = true)
+                    screen = Screen.Log(labels, uids)
                 })
-                is Screen.Log -> LogScreen(labels = s.labels, uids = s.uids, fresh = s.fresh)
+                is Screen.Log -> LogScreen(labels = s.labels, uids = s.uids)
             }
         }
     }
@@ -276,12 +275,20 @@ private fun PickerScreen(onPick: (List<String>, List<Int>) -> Unit) {
                     onClick = {
                         scope.launch {
                             status = "Setting ${picked.size} targets..."
-                            withContext(Dispatchers.IO) { ModuleCtl.send(ctx, "clear") }
-                            picked.forEachIndexed { i, e ->
-                                val cmd = if (i == 0) "target ${e.uid}" else "target+ ${e.uid}"
-                                withContext(Dispatchers.IO) { ModuleCtl.send(ctx, cmd) }
+                            val error = withContext(Dispatchers.IO) {
+                                var failure: String? = ModuleCtl.send(ctx, "clear").takeIf { !it.ok }?.error
+                                for ((i, e) in picked.withIndex()) {
+                                    if (failure != null) break
+                                    val r = ModuleCtl.send(ctx, if (i == 0) "target ${e.uid}" else "target+ ${e.uid}")
+                                    if (!r.ok) failure = r.error ?: "failed"
+                                }
+                                failure
                             }
-                            onPick(picked.map { it.label }, picked.map { it.uid })
+                            if (error == null) {
+                                onPick(picked.map { it.label }, picked.map { it.uid })
+                            } else {
+                                status = error
+                            }
                         }
                     }
                 )
@@ -424,14 +431,21 @@ private val EVENT_FILTERS = listOf(
 )
 
 @Composable
-private fun LogScreen(labels: List<String>, uids: List<Int>, fresh: Boolean) {
+private fun LogScreen(labels: List<String>, uids: List<Int>) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
     var status by remember { mutableStateOf("Starting...") }
     var allLines by remember { mutableStateOf(listOf<String>()) }
+    // dmesg lines carry a monotonic "[ 1234.567890]" stamp: use it to take only lines newer than
+    // what we already have (robust when the kernel buffer wraps). lastLine is the fallback for
+    // a dmesg without stamps.
+    var lastTs by remember { mutableStateOf(-1.0) }
+    var seenAtLastTs by remember { mutableStateOf(setOf<String>()) }
+    var useTs by remember { mutableStateOf(true) }
     var lastLine by remember { mutableStateOf<String?>(null) }
     var baselineDone by remember { mutableStateOf(false) }
+    var revision by remember { mutableStateOf(0) } // bumped whenever lines are appended
     var paused by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     val activeFilters = remember { mutableStateMapOf<String, Boolean>().apply { EVENT_FILTERS.forEach { put(it, false) } } }
@@ -474,40 +488,52 @@ private fun LogScreen(labels: List<String>, uids: List<Int>, fresh: Boolean) {
         var tick = 0
         while (true) {
             if (!paused) {
-                val res = withContext(Dispatchers.IO) { Su.run("dmesg | grep SCL; true") }
+                val res = withContext(Dispatchers.IO) { Su.run("dmesg | grep SCL | tail -n 4000; true") }
                 if (res.rc != 0) {
                     status = "su failed (rc=${res.rc}): ${res.err.trim()}. Grant root to this app in APatch."
                 } else {
-                    val lines = res.out.split('\n').filter { it.isNotBlank() }
+                    // control answers ("[SCL]ctl <token> ...") are chatter between app and module
+                    val lines = res.out.split('\n').filter { it.isNotBlank() && !it.contains("SCL]ctl ") }
+                    var fresh: List<String> = emptyList()
                     if (!baselineDone) {
+                        // new session: skip whatever the kernel buffer already holds
                         baselineDone = true
-                        if (fresh) {
+                        useTs = lines.isEmpty() || lines.any { dmesgTs(it) != null }
+                        if (useTs) {
+                            lastTs = lines.mapNotNull { dmesgTs(it) }.maxOrNull() ?: -1.0
+                            seenAtLastTs = lines.filter { dmesgTs(it) == lastTs }.toSet()
+                        } else {
                             lastLine = lines.lastOrNull()
-                            status = "Watching (older log lines skipped)"
                         }
+                        status = "Watching (older log lines skipped)"
+                    } else if (useTs) {
+                        fresh = lines.filter { l ->
+                            val t = dmesgTs(l)
+                            t != null && (t > lastTs || (t == lastTs && l !in seenAtLastTs))
+                        }
+                        if (fresh.isNotEmpty()) {
+                            val newTs = fresh.maxOf { dmesgTs(it) ?: lastTs }
+                            val atNewTs = fresh.filter { dmesgTs(it) == newTs }
+                            seenAtLastTs = if (newTs > lastTs) atNewTs.toSet() else seenAtLastTs + atNewTs
+                            lastTs = newTs
+                        }
+                    } else {
+                        val idx = lastLine?.let { lines.lastIndexOf(it) } ?: -1
+                        fresh = if (idx >= 0) lines.subList(idx + 1, lines.size) else lines
+                        lastLine = lines.lastOrNull() ?: lastLine
                     }
-                    if (baselineDone) {
-                        val last = lastLine
-                        val start = if (last == null) 0 else {
-                            val idx = lines.lastIndexOf(last)
-                            if (idx >= 0) idx + 1 else 0
-                        }
-                        if (start < lines.size) {
-                            lastLine = lines.last()
-                            val merged = (allLines + lines.subList(start, lines.size)).let {
-                                if (it.size > 20000) it.subList(it.size - 20000, it.size) else it
-                            }
-                            allLines = merged
-                            status = "${merged.size} lines"
-                        } else if (lines.isEmpty() && res.err.isNotBlank()) {
-                            status = "dmesg: ${res.err.trim()}"
-                        } else if (lines.isEmpty()) {
-                            status = "Root OK, no SCL lines yet"
-                        }
+                    if (fresh.isNotEmpty()) {
+                        allLines = (allLines + fresh).takeLast(20000)
+                        revision++
+                        status = "${allLines.size} lines"
+                    } else if (baselineDone && allLines.isEmpty() && res.err.isNotBlank()) {
+                        status = "dmesg: ${res.err.trim()}"
+                    } else if (baselineDone && allLines.isEmpty()) {
+                        status = "Root OK, no SCL lines yet"
                     }
                 }
                 if (autoTimeout && tick % 5 == 0) {
-                    withContext(Dispatchers.IO) { ModuleCtl.send(ctx, "ping") }
+                    withContext(Dispatchers.IO) { ModuleCtl.ping(ctx) }
                 }
             }
             tick++
@@ -517,7 +543,7 @@ private fun LogScreen(labels: List<String>, uids: List<Int>, fresh: Boolean) {
 
     // New lines while following -> jump to the newest one. Programmatic scrolling does not go
     // through nested scroll, so it never counts as the user interrupting.
-    LaunchedEffect(shown.size) {
+    LaunchedEffect(revision, filterRevision) {
         if (followTail && shown.isNotEmpty()) listState.scrollToItem(shown.size - 1)
     }
 
@@ -588,12 +614,8 @@ private fun LogScreen(labels: List<String>, uids: List<Int>, fresh: Boolean) {
                 )
 
                 Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    IconButton(onClick = { paused = !paused }) {
-                        Icon(MiuixIcons.Refresh, contentDescription = if (paused) "Resume" else "Pause")
-                    }
-                    IconButton(onClick = { moduleCmd("clear") }) {
-                        Icon(MiuixIcons.Back, contentDescription = "Stop target")
-                    }
+                    TextButton(text = if (paused) "Resume" else "Pause", onClick = { paused = !paused })
+                    TextButton(text = "Stop", onClick = { moduleCmd("clear") })
                     IconButton(onClick = {
                         val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                         val path = "/sdcard/Download/scl_$ts.log"
@@ -768,6 +790,11 @@ private fun BoxScope.ScrollThumb(
         )
     }
 }
+
+private val TS_RE = Regex("^\\[\\s*(\\d+\\.\\d+)]")
+
+/** Kernel timestamp of a dmesg line ("[ 1234.567890] ..."), or null when it has none. */
+private fun dmesgTs(line: String): Double? = TS_RE.find(line)?.groupValues?.get(1)?.toDoubleOrNull()
 
 @Composable
 private fun lineColor(l: String): Color = when {

@@ -20,8 +20,8 @@ android {
         applicationId = "app.sclviewer"
         minSdk = 26
         targetSdk = 36
-        versionName = "2.2.0"
-        versionCode = 10
+        versionName = "2.3.0"
+        versionCode = 11
 
         ndk {
             abiFilters += "arm64-v8a" // KernelPatch is ARM64 only

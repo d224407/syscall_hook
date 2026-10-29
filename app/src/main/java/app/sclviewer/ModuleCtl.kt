@@ -15,17 +15,27 @@ import kotlin.random.Random
 object ModuleCtl {
     data class Result(val ok: Boolean, val out: String, val error: String?)
 
-    private val SAFE = Regex("[A-Za-z0-9 _.:-]{1,100}")
+    private val SAFE = Regex("[A-Za-z0-9 _.:+-]{1,100}")
 
     fun send(ctx: Context, cmd: String): Result {
         return if (Prefs.legacyMode(ctx)) sendLegacy(ctx, cmd) else sendRoot(cmd)
+    }
+
+    /** Heartbeat: refreshes the module's timeout; the module sends no answer, so no dmesg read. */
+    fun ping(ctx: Context) {
+        if (Prefs.legacyMode(ctx)) {
+            val key = Prefs.superKey(ctx)
+            if (key.isNotEmpty()) Supercall.control(key, "ping")
+        } else {
+            Su.run("readlink '/.scl:p ping' >/dev/null 2>&1; true")
+        }
     }
 
     private fun sendRoot(cmd: String): Result {
         if (!SAFE.matches(cmd)) return Result(false, "", "Bad command")
         val tok = Random.nextInt(0x100000, 0xFFFFFF).toString(16)
         val script = "readlink '/.scl:$tok $cmd' >/dev/null 2>&1; " +
-            "dmesg | grep 'SCL]ctl $tok ' | tail -n 1; true"
+            "dmesg | tail -n 3000 | grep 'SCL]ctl $tok ' | tail -n 1; true"
         val r = Su.run(script)
         if (r.rc != 0) {
             return Result(false, "", "su failed (rc=${r.rc}): ${r.err.trim()}. Grant root to this app in APatch.")

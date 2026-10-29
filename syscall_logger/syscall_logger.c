@@ -1,65 +1,64 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * syscall_logger.c (v0.9.0) - KPM tracing su-related syscalls of a PID tree.
+ * syscall_logger.c (v0.10.0) - KPM tracing syscalls of target apps and what they spawn.
  *
- * Logic:
- *  - Tracked set = table of tgids. A process joins if it is listed (add),
- *    matches seed uid, is a child of a tracked pid (getppid check), or is
- *    forked by one (clone after-hook). Exits are removed (exit_group).
- *    Tracking by pid survives su (uid 0), unlike a uid filter.
- *  - Hooks: openat/faccessat/newfstatat (path probes, su-like only unless
- *    verbose), execve/execveat (+argv), connect (+addr), setuid family,
- *    ptrace, mount, clone, exit_group, read(0) (shell stdin, i.e. commands
- *    pushed through a pipe), sendto (DNS query name, UDP:53), write (HTTP
- *    request line + Host, TLS ClientHello SNI, and with `wr 1` the printable
- *    text of any other write, e.g. commands pushed over a pipe fd), sendmsg
- *    (same HTTP/TLS check as write, for vectored socket I/O), unlinkat
- *    (delete), mkdirat (create dir), renameat2 (move/rename), socket, bind.
- *    "[!]" marks su-like / uid 0 / remount.
- *  - Crash detection: a native crash on a tracked pid triggers Android's
- *    tombstone dumper (crash_dump32/64 <pid>), which this module recognizes
- *    system-wide (not just for tracked processes, since the dumper itself
- *    isn't one) and reports as event "crash". Java-level crashes (uncaught
- *    exceptions, ANRs) go through Binder to system_server with no syscall
- *    signature, so those are not detected.
- *  - Multi-target: up to 8 uids can be tracked at once (`target+`), each with
- *    its own pid subtree auto-attached the same way a single target is.
- *  - Not covered: permission-gated framework APIs (camera, mic, location,
- *    clipboard, contacts, SMS, ...) are Binder IPC calls into system_server,
- *    not plain syscalls, so a syscall hook cannot see them.
- *  - Output: printk only ("[SCL]" in dmesg); the viewer app reads dmesg, so
- *    there is no separate file sink to manage.
- *  - Heartbeat: the viewer app sends `ping` every few seconds while a target
- *    is open. No `ping` for HEARTBEAT_TIMEOUT seconds -> the module clears
- *    the target itself (seed uid + pid table), so it goes quiet on its own
- *    when the app is not running. `hb 0`/`hb 1` turns this off/on (the app's
- *    "Auto timeout" switch). Needs ktime_get_real_seconds/_seconds in
- *    kallsyms; if neither resolves, `list` reports hb=unsupported and only
- *    an explicit `clear` stops tracking.
- *  - Portability: every kernel symbol is resolved by name at load time with
- *    fallbacks for older/renamed variants (getpid/getppid/kill with and
- *    without the __arm64_sys_ prefix, ktime_get_real_seconds vs
- *    ktime_get_seconds, __arch_copy_from_user vs _copy_from_user vs
- *    copy_from_user). A device missing all variants of a required symbol
- *    fails cleanly at load ("cannot resolve ..."); a missing optional one
- *    (kill, ktime) just turns off pruning/heartbeat, not the whole module.
- *  - Limit: root shells spawned by a su daemon (magiskd) are not children of
- *    the app; only the client-side `su -c ...` argv is visible. TLS SNI is
- *    only the hostname: the request path and headers stay encrypted and are
- *    not visible to a syscall hook.
+ * Tracking:
+ *  - A process is traced when it is in the tgid table, belongs to a seed uid
+ *    (`target`/`target+`), is a child of a traced pid (getppid check), or was
+ *    forked by one (clone after-hook). exit_group removes it; pids killed by a
+ *    signal are pruned with kill(pid, 0). Pid-based tracking survives `su`
+ *    (uid 0), which a uid filter would not.
+ *  - Up to 8 uids at once; each has its pid subtree auto-attached.
+ *
+ * Events ("[SCL]" lines in dmesg; "[!]" marks su-like path / uid 0 / remount / crash):
+ *  - su & exec:  execve/execveat (+argv), setuid/setreuid/setresuid, ptrace,
+ *                mount, faccessat/newfstatat/openat (su-like paths only unless
+ *                `verbose 1`), read(0) (commands pushed to a shell via stdin),
+ *                clone ("fork"), exit_group ("exit").
+ *  - files:      unlinkat, mkdirat, renameat2.
+ *  - network:    connect (+address; unix sockets under /dev/socket hidden unless verbose),
+ *                socket/bind (inet only unless verbose), sendto (DNS query to
+ *                UDP:53, IPv4/IPv6), write+sendmsg payload inspection: HTTP
+ *                request line + Host, TLS ClientHello SNI, and DNS lookups
+ *                handed to netd over /dev/socket/dnsproxyd (how Android apps
+ *                actually resolve names). With `wr 1`, the printable text of
+ *                any other write (e.g. commands pushed over a pipe fd).
+ *  - crash:      debuggerd's handler inside a crashing process forks a child
+ *                that execs crash_dump32/64 <tid> ...; that child is in the
+ *                traced tree, so it is reported as "crash" for its parent.
+ *
+ * Limits:
+ *  - Java-level crashes/ANRs and permission-gated framework APIs (camera, mic,
+ *    location, clipboard, contacts, SMS...) are Binder IPC to system_server:
+ *    no plain syscall to hook.
+ *  - HTTPS shows the hostname (SNI) only; path/headers/body are encrypted.
+ *  - Root shells spawned by a su daemon (magiskd) are not children of the app;
+ *    only the client-side `su -c ...` argv is visible.
+ *  - 32-bit (compat) syscalls are not hooked.
+ *
+ * Heartbeat: the viewer app sends `ping` every few seconds. No command for
+ * HEARTBEAT_TIMEOUT seconds -> the module clears its targets itself, so it
+ * goes quiet when the app is gone. `hb 0`/`hb 1` turns that off/on. Needs
+ * ktime_get_real_seconds/_seconds in kallsyms; otherwise `list` reports
+ * hb=unsupported and only `clear` stops tracking.
+ *
+ * Portability: kernel symbols are resolved by name at load time with fallbacks
+ * for renamed variants (getpid/getppid/kill with and without __arm64_sys_,
+ * ktime_get_real_seconds vs ktime_get_seconds, __arch_copy_from_user vs
+ * _copy_from_user vs copy_from_user). A missing required symbol fails cleanly
+ * at load; a missing optional one (kill, ktime) only disables pruning/heartbeat.
  *
  * Control without SuperKey (new APatch verifies the manager signature instead):
  *   as root: readlink '/.scl:<token> <cmd>'  -> answer in dmesg "[SCL]ctl <token> <result>"
  * Commands (that channel, or APatch app: KPM tab -> module Control; also load args):
- *   add <pid> | del <pid> | uid <n> | target <uid> | target+ <uid> | untarget <uid>
+ *   add <pid> | del <pid> | target <uid> | target+ <uid> | untarget <uid>
  *   | clear | prune | ping | hb <0|1> | wr <0|1> | verbose <0|1> | list
  *   (a bare number means pid)
  *   clear    = drop all pids AND every seed uid (uid auto-attach would re-add pids).
- *   target   = clear, then auto-attach every process of <uid> (single-target, replaces).
- *   target+  = add <uid> to the current set of up to 8 tracked uids, without clearing.
- *   untarget = stop auto-attaching <uid> (processes already tracked stay until they exit).
- *   ping   = refresh the heartbeat only (same effect as any other command).
- *   Dead pids (killed by signal, no exit_group) are pruned with kill(pid, 0).
+ *   target   = clear, then auto-attach every process of <uid> (single target, replaces).
+ *   target+  = add <uid> to the set of tracked uids without clearing (max 8).
+ *   untarget = stop auto-attaching <uid> (already-tracked processes stay until they exit).
+ *   ping     = heartbeat only: refreshes the timeout, produces no answer line.
  */
 
 #include <compiler.h>
@@ -72,10 +71,10 @@
 #include <asm/current.h>
 
 KPM_NAME("syscall_logger");
-KPM_VERSION("0.9.0");
+KPM_VERSION("0.10.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("you");
-KPM_DESCRIPTION("Trace su-related syscalls of a PID tree (optionally seeded by UID)");
+KPM_DESCRIPTION("Trace syscalls of up to 8 target apps and everything they spawn");
 
 /* arm64 syscall numbers (fallbacks) */
 #ifndef __NR_mount
@@ -204,7 +203,8 @@ static void seed_clear(void)
 	for (i = 0; i < MAX_SEED_UIDS; i++)
 		seed_uids[i] = 0;
 }
-static volatile int verbose = 0;      /* 0: log su-like paths only */
+
+static volatile int verbose = 0; /* 0: log su-like paths only, no unix /dev/socket, no non-IP sockets */
 
 /* runtime-resolved kernel funcs */
 typedef long (*sys0_t)(void *);
@@ -441,8 +441,7 @@ static int is_target(pid_t *out_tgid)
 
 	if (!track_active && !seed_any())
 		return 0;
-	if (kf_now && hb_enabled && last_ping && (track_active || seed_any()) &&
-	    (kf_now() - last_ping) > HEARTBEAT_TIMEOUT) {
+	if (kf_now && hb_enabled && last_ping && (kf_now() - last_ping) > HEARTBEAT_TIMEOUT) {
 		seed_clear();
 		track_clear();
 		pr_info("[SCL] heartbeat timeout: target auto-cleared (viewer app not responding)\n");
@@ -618,43 +617,33 @@ static void h_newfstatat(hook_fargs4_t *a, void *udata)
 		   (unsigned long)syscall_argn(a, 3));
 }
 
-/*
- * Native crash detection: on a fatal signal, Android's kernel coredump path
- * execs /system/bin/crash_dump32|64 <pid> to write a tombstone. That exec is
- * made by tombstoned/debuggerd, a process we are not tracking - so this check
- * runs unconditionally on every exec, system-wide, independent of is_target().
- * The cost is two short basename compares per exec; negligible.
- */
-static void check_crash_dump(const char *fn, const char *av)
-{
-	const char *base = s_base(fn);
-	const char *p;
-	long crashed;
-	char d[48];
-
-	if (!s_eq(base, "crash_dump32") && !s_eq(base, "crash_dump64"))
-		return;
-	/* argv is "crash_dump64 <pid>" (plus a couple of internal flags on some ROMs) */
-	for (p = av; *p && *p != ' '; p++)
-		;
-	while (*p == ' ')
-		p++;
-	crashed = (long)parse_num(p);
-	if (crashed <= 1 || !track_has((pid_t)crashed))
-		return;
-	kf_scnprintf(d, sizeof(d), "dumper=%s", base);
-	pr_info("[SCL][!] pid=%ld uid=0 crash %s\n", crashed, d);
-}
-
 static void do_exec(pid_t pid, const char *ev, const char *fn, const char *av)
 {
 	char d[SCL_PATH + 340];
+	const char *base = s_base(fn);
 	int su;
 
 	su = su_like(fn) || (av[0] && s_eq(s_base(av), "su")) ||
 	     (av[0] && s_has(av, "su -") ) || (av[0] && s_has(av, "/su "));
 	kf_scnprintf(d, sizeof(d), "file=%s argv=%s", fn, av);
 	emit(pid, ev, d, su);
+
+	/*
+	 * Native crash: debuggerd's signal handler inside the crashing process forks a child that
+	 * execs crash_dump32/64 <crashing tid> <pseudothread tid> <dump type>. That child is in the
+	 * tracked tree, so report the crash against its parent (the crashing process). The first
+	 * argument is a TID, which need not equal the tgid for a crash on a non-main thread.
+	 */
+	if (s_eq(base, "crash_dump32") || s_eq(base, "crash_dump64")) {
+		const char *t = av;
+
+		while (*t && *t != ' ')
+			t++;
+		while (*t == ' ')
+			t++;
+		kf_scnprintf(d, sizeof(d), "dumper=%s tid=%lu", base, parse_num(t));
+		emit(cur_ppid(), "crash", d, 1);
+	}
 }
 
 /* execve(const char *filename, char *const argv[], char *const envp[]) */
@@ -664,11 +653,10 @@ static void h_execve(hook_fargs3_t *a, void *udata)
 	char fn[SCL_PATH];
 	char av[320];
 
-	read_path((const char __user *)syscall_argn(a, 0), fn, sizeof(fn));
-	read_argv((const char __user *const __user *)syscall_argn(a, 1), av, sizeof(av));
-	check_crash_dump(fn, av);
 	if (!is_target(&pid))
 		return;
+	read_path((const char __user *)syscall_argn(a, 0), fn, sizeof(fn));
+	read_argv((const char __user *const __user *)syscall_argn(a, 1), av, sizeof(av));
 	do_exec(pid, "execve", fn, av);
 }
 
@@ -679,11 +667,10 @@ static void h_execveat(hook_fargs5_t *a, void *udata)
 	char fn[SCL_PATH];
 	char av[320];
 
-	read_path((const char __user *)syscall_argn(a, 1), fn, sizeof(fn));
-	read_argv((const char __user *const __user *)syscall_argn(a, 2), av, sizeof(av));
-	check_crash_dump(fn, av);
 	if (!is_target(&pid))
 		return;
+	read_path((const char __user *)syscall_argn(a, 1), fn, sizeof(fn));
+	read_argv((const char __user *const __user *)syscall_argn(a, 2), av, sizeof(av));
 	do_exec(pid, "execveat", fn, av);
 }
 
@@ -859,19 +846,12 @@ static int dns_qname(const unsigned char *b, int n, char *out, int cap)
 	return j > 0;
 }
 
-/* Printable text preview of a write() payload; empty string for binary data. */
-static void write_preview(const unsigned char *b, int n, char *out, int cap)
+/* Newline -> "\n", printable ASCII kept, tab -> space, CR dropped, anything else -> '.'. */
+static void text_escape(const unsigned char *b, int n, char *out, int cap)
 {
-	int i, j = 0, printable = 0;
-	int m = n > 160 ? 160 : n;
+	int i, j = 0;
 
-	out[0] = 0;
-	for (i = 0; i < m; i++)
-		if ((b[i] >= 32 && b[i] < 127) || b[i] == 9 || b[i] == 10 || b[i] == 13)
-			printable++;
-	if (printable * 10 < m * 8)
-		return; /* mostly binary: skip */
-	for (i = 0; i < m && j < cap - 4; i++) {
+	for (i = 0; i < n && j < cap - 4; i++) {
 		if (b[i] == 10) {
 			out[j++] = 92; /* backslash */
 			out[j++] = 110; /* n */
@@ -879,9 +859,133 @@ static void write_preview(const unsigned char *b, int n, char *out, int cap)
 			out[j++] = (char)b[i];
 		} else if (b[i] == 9) {
 			out[j++] = 32;
+		} else if (b[i] != 13) {
+			out[j++] = 46;
 		}
 	}
 	out[j] = 0;
+}
+
+/* Printable text preview of a write() payload; empty string when it is mostly binary. */
+static void write_preview(const unsigned char *b, int n, char *out, int cap)
+{
+	int i, printable = 0;
+	int m = n > 160 ? 160 : n;
+
+	out[0] = 0;
+	for (i = 0; i < m; i++)
+		if ((b[i] >= 32 && b[i] < 127) || b[i] == 9 || b[i] == 10 || b[i] == 13)
+			printable++;
+	if (printable * 10 < m * 8)
+		return;
+	text_escape(b, m, out, cap);
+}
+
+/*
+ * Android apps do not talk DNS themselves: libc hands the lookup to netd/the DNS resolver over
+ * the unix socket /dev/socket/dnsproxyd with a text command, e.g. "getaddrinfo example.com ^ 0 ..."
+ * or "gethostbyname <netid> example.com <af>". Take the first token after the command that is
+ * not purely digits and not "^" (the placeholder for "no value").
+ */
+static int dnsproxy_host(const unsigned char *b, int n, char *out, int cap)
+{
+	int p, j = 0;
+
+	if (b_starts(b, n, "getaddrinfo "))
+		p = 12;
+	else if (b_starts(b, n, "gethostbyname "))
+		p = 14;
+	else
+		return 0;
+	while (p < n) {
+		int start = p, digits = 1;
+
+		while (p < n && b[p] != ' ' && b[p] != 0) {
+			if (b[p] < '0' || b[p] > '9')
+				digits = 0;
+			p++;
+		}
+		if (p > start && !digits && !(p - start == 1 && b[start] == '^')) {
+			for (j = 0; start + j < p && j < cap - 1; j++)
+				out[j] = (char)b[start + j];
+			out[j] = 0;
+			return 1;
+		}
+		while (p < n && (b[p] == ' ' || b[p] == 0))
+			p++;
+	}
+	return 0;
+}
+
+/*
+ * Shared by write() and sendmsg(): HTTP request line + Host, TLS ClientHello SNI, a DNS lookup
+ * handed to dnsproxyd, and (with `wr 1`) a text preview of anything else. Returns after the
+ * first match.
+ */
+static void inspect_payload(pid_t pid, int fd, const unsigned char *buf, int len)
+{
+	char host[128];
+	char line[220];
+	char d[320];
+
+	if (is_http_method(buf, len)) {
+		http_summarize(buf, len, line, sizeof(line));
+		kf_scnprintf(d, sizeof(d), "fd=%d %s", fd, line);
+		emit(pid, "http", d, 0);
+		return;
+	}
+	if (tls_sni(buf, len, host, sizeof(host))) {
+		kf_scnprintf(d, sizeof(d), "fd=%d sni=%s", fd, host);
+		emit(pid, "tls", d, 0);
+		return;
+	}
+	if (dnsproxy_host(buf, len, host, sizeof(host))) {
+		kf_scnprintf(d, sizeof(d), "query=%s via=dnsproxyd", host);
+		emit(pid, "dns", d, 0);
+		return;
+	}
+	if (wr_mode) {
+		write_preview(buf, len, line, sizeof(line));
+		if (line[0]) {
+			kf_scnprintf(d, sizeof(d), "fd=%d len=%d data=%s", fd, len, line);
+			emit(pid, "write", d, 0);
+		}
+	}
+}
+
+/*
+ * Cheap first look at the first bytes of a payload so ordinary writes do not pay for a full
+ * copy: HTTP methods start with G/P/D/O/H/C, a TLS record with 0x16, a dnsproxyd command with
+ * 'g'. With `wr 1` everything is interesting.
+ */
+static int payload_interesting(const unsigned char *b, int n)
+{
+	if (wr_mode)
+		return 1;
+	if (n < 1)
+		return 0;
+	return b[0] == 0x16 || b[0] == 'G' || b[0] == 'P' || b[0] == 'D' || b[0] == 'O' ||
+	       b[0] == 'H' || b[0] == 'C' || b[0] == 'g';
+}
+
+/*
+ * Copy the start of a user buffer for inspect_payload(). Peeks 8 bytes first and only copies the
+ * rest when the payload could be something we recognise. Returns the number of bytes in buf, or 0.
+ */
+static int fetch_payload(const void __user *u, long len, unsigned char *buf, int cap)
+{
+	int n;
+
+	if (len < 1 || (len < 16 && !wr_mode))
+		return 0;
+	n = len > cap ? cap : (int)len;
+	if (ucopy(buf, u, n < 8 ? (unsigned long)n : 8UL))
+		return 0;
+	if (!payload_interesting(buf, n < 8 ? n : 8))
+		return 0;
+	if (n > 8 && ucopy(buf + 8, (const unsigned char __user *)u + 8, (unsigned long)(n - 8)))
+		return 0;
+	return n;
 }
 
 /* sendto(int fd, const void *buf, size_t len, int flags, struct sockaddr *dest_addr, int addrlen) */
@@ -889,21 +993,24 @@ static void h_sendto(hook_fargs6_t *a, void *udata)
 {
 	pid_t pid;
 	unsigned char buf[SCL_NET_BUF];
-	unsigned char sa[16];
+	unsigned char sa[32]; /* sockaddr_in6 is 28 bytes: IPv6 resolvers must not be skipped */
 	char name[192];
 	char d[220];
 	long len = (long)syscall_argn(a, 2);
 	int alen = (int)syscall_argn(a, 5);
-	unsigned int port;
+	unsigned int port, fam;
 
 	if (!is_target(&pid))
 		return;
-	if (len < 12 || alen < 4 || alen > (int)sizeof(sa))
+	if (len < 12 || alen < 4)
 		return;
+	if (alen > (int)sizeof(sa))
+		alen = (int)sizeof(sa);
 	if (ucopy(sa, (const void __user *)syscall_argn(a, 4), (unsigned long)alen))
 		return;
+	fam = (unsigned int)sa[0] | ((unsigned int)sa[1] << 8);
 	port = ((unsigned int)sa[2] << 8) | sa[3];
-	if (port != 53)
+	if ((fam != 2 && fam != 10) || port != 53) /* AF_INET / AF_INET6, UDP:53 */
 		return;
 	if (len > (long)sizeof(buf))
 		len = (long)sizeof(buf);
@@ -929,11 +1036,7 @@ static void h_sendmsg(hook_fargs3_t *a, void *udata)
 	unsigned long hdr[7];
 	unsigned long iov[2];
 	unsigned char buf[SCL_NET_BUF];
-	char host[128];
-	char line[220];
-	char d[320];
-	long len;
-	int fd = (int)syscall_argn(a, 0);
+	int n;
 
 	if (!is_target(&pid))
 		return;
@@ -943,65 +1046,24 @@ static void h_sendmsg(hook_fargs3_t *a, void *udata)
 		return;
 	if (ucopy(iov, (const void __user *)hdr[2], sizeof(iov))) /* first iovec */
 		return;
-	len = (long)iov[1];
-	if (len < 16)
-		return;
-	if (len > (long)sizeof(buf))
-		len = (long)sizeof(buf);
-	if (ucopy(buf, (const void __user *)iov[0], (unsigned long)len))
-		return;
-
-	if (is_http_method(buf, (int)len)) {
-		http_summarize(buf, (int)len, line, sizeof(line));
-		kf_scnprintf(d, sizeof(d), "fd=%d %s", fd, line);
-		emit(pid, "http", d, 0);
-		return;
-	}
-	if (tls_sni(buf, (int)len, host, sizeof(host))) {
-		kf_scnprintf(d, sizeof(d), "fd=%d sni=%s", fd, host);
-		emit(pid, "tls", d, 0);
-	}
+	n = fetch_payload((const void __user *)iov[0], (long)iov[1], buf, sizeof(buf));
+	if (n)
+		inspect_payload(pid, (int)syscall_argn(a, 0), buf, n);
 }
 
-/* write(int fd, const void *buf, size_t count): plaintext HTTP or TLS ClientHello only */
+/* write(int fd, const void *buf, size_t count) */
 static void h_write(hook_fargs3_t *a, void *udata)
 {
 	pid_t pid;
 	unsigned char buf[SCL_NET_BUF];
-	char host[128];
-	char line[220];
-	char d[320];
-	long len = (long)syscall_argn(a, 2);
-	int fd = (int)syscall_argn(a, 0);
+	int n;
 
 	if (!is_target(&pid))
 		return;
-	if (len < 1 || (len < 16 && !wr_mode))
-		return;
-	if (len > (long)sizeof(buf))
-		len = (long)sizeof(buf);
-	if (ucopy(buf, (const void __user *)syscall_argn(a, 1), (unsigned long)len))
-		return;
-
-	if (is_http_method(buf, (int)len)) {
-		http_summarize(buf, (int)len, line, sizeof(line));
-		kf_scnprintf(d, sizeof(d), "fd=%d %s", fd, line);
-		emit(pid, "http", d, 0);
-		return;
-	}
-	if (tls_sni(buf, (int)len, host, sizeof(host))) {
-		kf_scnprintf(d, sizeof(d), "fd=%d sni=%s", fd, host);
-		emit(pid, "tls", d, 0);
-		return;
-	}
-	if (wr_mode) {
-		write_preview(buf, (int)len, line, sizeof(line));
-		if (line[0]) {
-			kf_scnprintf(d, sizeof(d), "fd=%d len=%ld data=%s", fd,
-				     (long)syscall_argn(a, 2), line);
-			emit(pid, "write", d, 0);
-		}
-	}
+	n = fetch_payload((const void __user *)syscall_argn(a, 1), (long)syscall_argn(a, 2), buf,
+			  sizeof(buf));
+	if (n)
+		inspect_payload(pid, (int)syscall_argn(a, 0), buf, n);
 }
 
 /*
@@ -1061,11 +1123,15 @@ static void h_socket(hook_fargs3_t *a, void *udata)
 {
 	pid_t pid;
 	char d[64];
+	long family = (long)syscall_argn(a, 0);
 
 	if (!is_target(&pid))
 		return;
-	kf_scnprintf(d, sizeof(d), "family=%ld type=%ld proto=%ld", (long)syscall_argn(a, 0),
-		     (long)syscall_argn(a, 1), (long)syscall_argn(a, 2));
+	/* AF_INET, AF_INET6, AF_PACKET are internet-facing; unix/netlink sockets are plumbing */
+	if (!verbose && family != 2 && family != 10 && family != 17)
+		return;
+	kf_scnprintf(d, sizeof(d), "family=%ld type=%ld proto=%ld", family, (long)syscall_argn(a, 1),
+		     (long)syscall_argn(a, 2));
 	emit(pid, "socket", d, 0);
 }
 
@@ -1226,7 +1292,6 @@ static void h_read_after(hook_fargs3_t *a, void *udata)
 	unsigned char raw[160];
 	char d[400];
 	long n = (long)a->ret;
-	int i, j = 0;
 
 	if ((int)syscall_argn(a, 0) != 0 || n <= 0)
 		return;
@@ -1236,22 +1301,12 @@ static void h_read_after(hook_fargs3_t *a, void *udata)
 		n = (long)sizeof(raw);
 	if (ucopy(raw, (const void __user *)syscall_argn(a, 1), n))
 		return;
-	for (i = 0; i < n && j < (int)sizeof(d) - 4; i++) {
-		if (raw[i] == 10) {
-			d[j++] = 92;
-			d[j++] = 110;
-		} else if (raw[i] >= 32 && raw[i] < 127) {
-			d[j++] = (char)raw[i];
-		} else if (raw[i] != 13) {
-			d[j++] = 46;
-		}
-	}
-	d[j] = 0;
+	text_escape(raw, (int)n, d, sizeof(d));
 	emit(pid, "stdin", d, current_uid() == 0);
 }
 
-/* run_cmd() is defined further down */
-static void run_cmd(const char *args, char *echo, int cap);
+/* run_cmd() is defined further down; returns 1 for a silent `ping` (no answer wanted) */
+static int run_cmd(const char *args, char *echo, int cap);
 
 /*
  * Control channel for root, no SuperKey needed:
@@ -1263,10 +1318,14 @@ static void h_readlinkat(hook_fargs4_t *a, void *udata)
 	char path[SCL_PATH];
 	char echo[512];
 	char tok[24];
+	char peek[6];
 	const char *p;
 	int i;
 
 	if (current_uid() != 0)
+		return;
+	/* Peek at the first bytes: every root readlinkat passes through here. */
+	if (ucopy(peek, (const void __user *)syscall_argn(a, 1), 6) || !b_starts((unsigned char *)peek, 6, "/.scl:"))
 		return;
 	read_path((const char __user *)syscall_argn(a, 1), path, sizeof(path));
 	p = s_prefix(path, "/.scl:");
@@ -1275,8 +1334,8 @@ static void h_readlinkat(hook_fargs4_t *a, void *udata)
 	for (i = 0; p[i] && p[i] != ' ' && i < (int)sizeof(tok) - 1; i++)
 		tok[i] = p[i];
 	tok[i] = 0;
-	run_cmd(p + i, echo, sizeof(echo));
-	pr_info("[SCL]ctl %s %s\n", tok, echo);
+	if (!run_cmd(p + i, echo, sizeof(echo)))
+		pr_info("[SCL]ctl %s %s\n", tok, echo);
 }
 
 struct scl_hook {
@@ -1327,7 +1386,7 @@ static void unhook_all(void)
 }
 
 /* commands (init args + control) */
-static void run_cmd(const char *args, char *echo, int cap)
+static int run_cmd(const char *args, char *echo, int cap)
 {
 	const char *r;
 	char tmp[96];
@@ -1340,8 +1399,10 @@ static void run_cmd(const char *args, char *echo, int cap)
 	while (args && *args == ' ')
 		args++;
 
-	if (!args || !*args || s_prefix(args, "ping")) {
-		/* status-only / heartbeat refresh, handled above */
+	if (args && s_prefix(args, "ping"))
+		return 1; /* heartbeat refreshed above; nothing to report, skip prune/status work */
+
+	if (!args || !*args) {
 		/* status only */
 	} else if (args[0] >= '0' && args[0] <= '9') {
 		track_add((pid_t)parse_num(args));
@@ -1366,8 +1427,6 @@ static void run_cmd(const char *args, char *echo, int cap)
 		hb_enabled = parse_num(r) ? 1 : 0;
 	} else if ((r = s_prefix(args, "wr "))) {
 		wr_mode = parse_num(r) ? 1 : 0;
-	} else if ((r = s_prefix(args, "uid "))) {
-		seed_add((uid_t)parse_num(r));
 	} else if ((r = s_prefix(args, "verbose "))) {
 		verbose = parse_num(r) ? 1 : 0;
 	} else if (!s_prefix(args, "list")) {
@@ -1409,6 +1468,7 @@ static void run_cmd(const char *args, char *echo, int cap)
 		}
 		len = s_append(echo, cap, len, tmp);
 	}
+	return 0;
 }
 
 static unsigned long lookup3(const char *a, const char *b, const char *c)

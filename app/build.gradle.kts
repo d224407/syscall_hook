@@ -15,6 +15,7 @@ val hasReleaseKeystore = keystoreProps.getProperty("storeFile") != null
 android {
     namespace = "app.sclviewer"
     compileSdk = 37
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "app.sclviewer"

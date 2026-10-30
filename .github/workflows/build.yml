@@ -62,26 +62,6 @@ jobs:
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
-      - name: Cache NDK + CMake
-        uses: actions/cache@v4
-        with:
-          path: |
-            /usr/local/lib/android/sdk/ndk/28.2.13676358
-            /usr/local/lib/android/sdk/cmake/3.22.1
-          key: android-ndk-28.2.13676358-cmake-3.22.1
-
-      - name: Install NDK + CMake (pinned, with retries)
-        run: |
-          SDKM="$(command -v sdkmanager || echo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager")"
-          yes | "$SDKM" --licenses > /dev/null || true
-          for i in 1 2 3; do
-            "$SDKM" --install "ndk;28.2.13676358" "cmake;3.22.1" && break
-            echo "sdkmanager failed (try $i): dropping partial downloads and retrying"
-            rm -rf "$ANDROID_HOME/ndk/28.2.13676358" "$ANDROID_HOME/.temp"
-            sleep 5
-          done
-          test -f "$ANDROID_HOME/ndk/28.2.13676358/source.properties"
-
 
       - name: Prepare release keystore
         if: env.HAS_KEYSTORE == 'true'
@@ -105,10 +85,10 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
 
   release:
-    # A release is cut only for a push to main whose commit message names a version, e.g.
-    #   "app 2.4.0: ..."  and/or  "module 0.11.0: ..."
-    # The tag is built from those versions (app-2.4.0, module-0.11.0, or app-2.4.0_module-0.11.0),
-    # the release body is the commit message plus the commit hash. No rolling "latest" tag.
+    # Every push to main publishes a release. Tag, title and file names all follow
+    #   <name>-<workflow run number>-<short commit hash>[.ext]
+    # e.g. tag "syscall_hook-57-a1b2c3d" with SclViewer-57-a1b2c3d.apk and
+    # syscall_logger-57-a1b2c3d.kpm. The body is the commit message plus the full hash.
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: [kpm, android]
     runs-on: ubuntu-latest
@@ -119,43 +99,42 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Read versions from the commit message
-        id: ver
-        run: |
-          git log -1 --pretty=%B > msg.txt
-          app=$(grep -ioE '\bapp v?[0-9]+\.[0-9]+\.[0-9]+' msg.txt | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
-          mod=$(grep -ioE '\bmodule v?[0-9]+\.[0-9]+\.[0-9]+' msg.txt | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
-          tag=""
-          [ -n "$app" ] && tag="app-$app"
-          [ -n "$mod" ] && tag="${tag:+${tag}_}module-$mod"
-          { echo "app=$app"; echo "mod=$mod"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
-          { cat msg.txt; printf '\n\nCommit: %s\n' "$GITHUB_SHA"; } > body.md
-
       - name: Download artifacts
-        if: steps.ver.outputs.tag != ''
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Put the app version in the APK name
-        if: steps.ver.outputs.app != ''
-        run: mv dist/app-release.apk "dist/SclViewer-${{ steps.ver.outputs.app }}.apk" || true
+      - name: Name everything <file>-<run>-<hash>
+        id: name
+        env:
+          REPO: ${{ github.event.repository.name }}
+          RUN: ${{ github.run_number }}
+        run: |
+          id="${RUN}-${GITHUB_SHA::7}"
+          for f in dist/*; do
+            base="${f##*/}"
+            ext="${base##*.}"
+            stem="${base%.*}"
+            case "$ext" in
+              apk) stem="SclViewer" ;;
+              *)   stem="$(printf '%s' "$stem" | sed -E 's/[_-]v?[0-9]+(\.[0-9]+)*$//')" ;;
+            esac
+            mv "$f" "dist/${stem}-${id}.${ext}"
+          done
+          ls -l dist
+          echo "tag=${REPO}-${id}" >> "$GITHUB_OUTPUT"
+          { git log -1 --pretty=%B; printf '\n\nCommit: %s\n' "$GITHUB_SHA"; } > body.md
 
       - name: Publish release
-        if: steps.ver.outputs.tag != ''
         uses: ncipollo/release-action@v1.14.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ steps.ver.outputs.tag }}
-          name: ${{ steps.ver.outputs.tag }}
+          tag: ${{ steps.name.outputs.tag }}
+          name: ${{ steps.name.outputs.tag }}
           commit: ${{ github.sha }}
           bodyFile: body.md
           artifacts: "dist/*"
           allowUpdates: true
           replacesArtifacts: true
           makeLatest: true
-
-      - name: No release (no version in the commit message)
-        if: steps.ver.outputs.tag == ''
-        run: echo "::notice::No 'app x.y.z' / 'module x.y.z' in the commit message, so no release was cut."

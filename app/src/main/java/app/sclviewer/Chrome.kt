@@ -1,7 +1,7 @@
 package app.sclviewer
 
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -24,7 +24,6 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import top.yukonga.miuix.kmp.basic.ButtonDefaults
@@ -68,6 +67,11 @@ internal fun rememberScrollHider(onDelta: (Float) -> Unit): NestedScrollConnecti
  * bottom while the user scrolls and returns shortly after scrolling stops. The offset is applied
  * in the graphics layer, so animating it does not recompose or re-layout anything.
  */
+// Icons never leave the screen or move - only a subtle shrink + dim while scrolling, so there
+// is never a moment where a tap lands on the wrong (just-appeared) target. A gentle spring
+// instead of a linear tween keeps it from feeling stiff.
+private val ChromeSpring = spring<Float>(dampingRatio = 0.75f, stiffness = 380f)
+
 @Composable
 internal fun BoxScope.BottomChrome(
     visible: Boolean,
@@ -80,14 +84,18 @@ internal fun BoxScope.BottomChrome(
     onFilter: () -> Unit,
     onActions: () -> Unit
 ) {
-    val hidePx = with(LocalDensity.current) { 180.dp.toPx() }
-    val progress by animateFloatAsState(if (visible) 0f else 1f, animationSpec = tween(110), label = "chrome")
+    val scale by animateFloatAsState(if (visible) 1f else 0.93f, animationSpec = ChromeSpring, label = "chromeScale")
+    val dim by animateFloatAsState(if (visible) 1f else 0.6f, animationSpec = ChromeSpring, label = "chromeDim")
 
     Column(
         Modifier
             .align(Alignment.BottomCenter)
             .padding(bottom = bottomInset + 12.dp)
-            .graphicsLayer { translationY = progress * hidePx },
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                alpha = dim
+            },
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {

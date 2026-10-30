@@ -15,14 +15,13 @@ val hasReleaseKeystore = keystoreProps.getProperty("storeFile") != null
 android {
     namespace = "app.sclviewer"
     compileSdk = 37
-    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "app.sclviewer"
         minSdk = 26
         targetSdk = 36
-        versionName = "2.4.0"
-        versionCode = 12
+        versionName = "2.5.1"
+        versionCode = 14
 
         ndk {
             abiFilters += "arm64-v8a" // KernelPatch is ARM64 only

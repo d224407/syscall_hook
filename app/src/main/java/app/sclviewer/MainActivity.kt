@@ -3,6 +3,7 @@ package app.sclviewer
 import android.os.Bundle
 import android.os.SystemClock
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -94,6 +95,14 @@ private fun AppRoot() {
     }
     LaunchedEffect(tab) { barVisible = true }
 
+    // System/gesture back: go to the previous screen instead of exiting the app. It only
+    // switches tabs - it does not touch the log, so an accidental tap on the Apps tab (or a back
+    // press) never wipes what has been collected. The log is cleared only when a new session
+    // actually starts (log.reset() below, keyed on sessionId).
+    BackHandler(enabled = tab != Tab.Apps) {
+        tab = Tab.Apps
+    }
+
     LaunchedEffect(Unit) {
         apps = withContext(Dispatchers.IO) { loadApps(ctx.packageManager) }
     }
@@ -161,6 +170,7 @@ private fun AppRoot() {
                     apps = apps,
                     notice = notice,
                     selected = selected,
+                    tracedUids = targetUids,
                     showSystem = showSystem,
                     bottomPadding = listBottom,
                     onToggle = { pkg -> if (selected.contains(pkg)) selected.remove(pkg) else selected.add(pkg) },

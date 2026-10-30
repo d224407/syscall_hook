@@ -75,6 +75,7 @@ internal fun AppsScreen(
     apps: List<AppEntry>,
     notice: String,
     selected: List<String>,
+    tracedUids: List<Int>,
     showSystem: Boolean,
     bottomPadding: Dp,
     onToggle: (String) -> Unit,
@@ -82,12 +83,20 @@ internal fun AppsScreen(
     onUserScroll: () -> Unit
 ) {
     var query by remember { mutableStateOf("") }
-    val shown = remember(apps, query, showSystem) {
+    // Currently traced app(s) first, then checked-but-not-yet-traced ones, then the rest -
+    // each group kept alphabetical. Re-sorts only when tracedUids/selected actually change, not
+    // on every recomposition, so the list does not jump around while scrolling.
+    val shown = remember(apps, query, showSystem, selected, tracedUids) {
         val q = query.lowercase()
+        val tracedSet = tracedUids.toSet()
         apps.filter {
             (showSystem || !it.system) &&
                 (q.isEmpty() || it.label.lowercase().contains(q) || it.pkg.lowercase().contains(q))
-        }
+        }.sortedWith(
+            compareByDescending<AppEntry> { tracedSet.contains(it.uid) }
+                .thenByDescending { selected.contains(it.pkg) }
+                .thenBy { it.label.lowercase() }
+        )
     }
     val scrollHook = rememberScrollHider { onUserScroll() }
 
@@ -115,6 +124,7 @@ internal fun AppsScreen(
                 AppRow(
                     entry = entry,
                     checked = selected.contains(entry.pkg),
+                    traced = tracedUids.contains(entry.uid),
                     onToggle = { onToggle(entry.pkg) },
                     onClick = { onTrace(entry) }
                 )
@@ -124,7 +134,7 @@ internal fun AppsScreen(
 }
 
 @Composable
-private fun AppRow(entry: AppEntry, checked: Boolean, onToggle: () -> Unit, onClick: () -> Unit) {
+private fun AppRow(entry: AppEntry, checked: Boolean, traced: Boolean, onToggle: () -> Unit, onClick: () -> Unit) {
     val ctx = LocalContext.current
     var bitmap by remember(entry.pkg) { mutableStateOf<Bitmap?>(null) }
 
@@ -164,7 +174,19 @@ private fun AppRow(entry: AppEntry, checked: Boolean, onToggle: () -> Unit, onCl
             }
         }
         Column(Modifier.weight(1f).padding(start = 12.dp)) {
-            Text(entry.label, style = MiuixTheme.textStyles.body1)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(entry.label, style = MiuixTheme.textStyles.body1)
+                if (traced) {
+                    Box(
+                        Modifier
+                            .padding(start = 8.dp)
+                            .background(MiuixTheme.colorScheme.primary, RoundedCornerShape(6.dp))
+                            .padding(horizontal = 6.dp, vertical = 1.dp)
+                    ) {
+                        Text("Tracing", style = MiuixTheme.textStyles.body2, color = MiuixTheme.colorScheme.onPrimary)
+                    }
+                }
+            }
             Text(
                 "${entry.pkg}  -  uid ${entry.uid}",
                 style = MiuixTheme.textStyles.body2,

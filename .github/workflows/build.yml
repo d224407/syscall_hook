@@ -12,15 +12,6 @@ on:
       - "*.kts"
       - "gradle.properties"
   workflow_dispatch:
-    inputs:
-      release:
-        description: 'Publish a GitHub release with the kpm and the release APK'
-        required: false
-        default: 'false'
-      version:
-        description: 'release version'
-        required: false
-        default: '2024051900'
 
 jobs:
   kpm:
@@ -94,44 +85,57 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
 
   release:
-    # Every push to main publishes/updates one rolling release (tag "latest"); a manual
-    # run can additionally publish a separate tagged release via the release/version inputs.
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event.inputs.release == 'true')
+    # A release is cut only for a push to main whose commit message names a version, e.g.
+    #   "app 2.4.0: ..."  and/or  "module 0.11.0: ..."
+    # The tag is built from those versions (app-2.4.0, module-0.11.0, or app-2.4.0_module-0.11.0),
+    # the release body is the commit message plus the commit hash. No rolling "latest" tag.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: [kpm, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Read versions from the commit message
+        id: ver
+        run: |
+          git log -1 --pretty=%B > msg.txt
+          app=$(grep -ioE '\bapp v?[0-9]+\.[0-9]+\.[0-9]+' msg.txt | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+          mod=$(grep -ioE '\bmodule v?[0-9]+\.[0-9]+\.[0-9]+' msg.txt | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+          tag=""
+          [ -n "$app" ] && tag="app-$app"
+          [ -n "$mod" ] && tag="${tag:+${tag}_}module-$mod"
+          { echo "app=$app"; echo "mod=$mod"; echo "tag=$tag"; } >> "$GITHUB_OUTPUT"
+          { cat msg.txt; printf '\n\nCommit: %s\n' "$GITHUB_SHA"; } > body.md
+
       - name: Download artifacts
+        if: steps.ver.outputs.tag != ''
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Upload rolling release (latest)
-        if: github.event_name == 'push'
-        uses: ncipollo/release-action@v1.14.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          name: latest
-          tag: latest
-          body: Built from the latest commit on main (${{ github.sha }}).
-          artifacts: "dist/*"
-          allowUpdates: true
-          makeLatest: true
-          omitBodyDuringUpdate: false
-          replacesArtifacts: true
+      - name: Put the app version in the APK name
+        if: steps.ver.outputs.app != ''
+        run: mv dist/app-release.apk "dist/SclViewer-${{ steps.ver.outputs.app }}.apk" || true
 
-      - name: Upload tagged release
-        if: github.event.inputs.release == 'true'
+      - name: Publish release
+        if: steps.ver.outputs.tag != ''
         uses: ncipollo/release-action@v1.14.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          name: ${{ github.event.inputs.version }}
-          tag: ${{ github.event.inputs.version }}
-          body: This release is built by github-action.
+          tag: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          commit: ${{ github.sha }}
+          bodyFile: body.md
           artifacts: "dist/*"
           allowUpdates: true
-          makeLatest: true
-          omitBodyDuringUpdate: true
           replacesArtifacts: true
+          makeLatest: true
+
+      - name: No release (no version in the commit message)
+        if: steps.ver.outputs.tag == ''
+        run: echo "::notice::No 'app x.y.z' / 'module x.y.z' in the commit message, so no release was cut."

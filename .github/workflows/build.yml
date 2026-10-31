@@ -85,9 +85,9 @@ jobs:
           path: app/build/outputs/apk/release/*.apk
 
   release:
-    # Every push to main publishes a release. Tag, title and file names all follow
-    #   <name>-<workflow run number>-<short commit hash>[.ext]
-    # e.g. tag "syscall_hook-57-a1b2c3d" with SclViewer-57-a1b2c3d.apk and
+    # Every push to main publishes a release. Tag and title are just
+    #   <workflow run number>-<short commit hash>
+    # file names keep their own stem, e.g. sclviewer-57-a1b2c3d.apk and
     # syscall_logger-57-a1b2c3d.kpm. The body is the commit message plus the full hash.
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: [kpm, android]
@@ -108,7 +108,6 @@ jobs:
       - name: Name everything <file>-<run>-<hash>
         id: name
         env:
-          REPO: ${{ github.event.repository.name }}
           RUN: ${{ github.run_number }}
         run: |
           id="${RUN}-${GITHUB_SHA::7}"
@@ -117,13 +116,13 @@ jobs:
             ext="${base##*.}"
             stem="${base%.*}"
             case "$ext" in
-              apk) stem="SclViewer" ;;
+              apk) stem="sclviewer" ;;
               *)   stem="$(printf '%s' "$stem" | sed -E 's/[_-]v?[0-9]+(\.[0-9]+)*$//')" ;;
             esac
             mv "$f" "dist/${stem}-${id}.${ext}"
           done
           ls -l dist
-          echo "tag=${REPO}-${id}" >> "$GITHUB_OUTPUT"
+          echo "tag=${id}" >> "$GITHUB_OUTPUT"
           { git log -1 --pretty=%B; printf '\n\nCommit: %s\n' "$GITHUB_SHA"; } > body.md
 
       - name: Publish release
